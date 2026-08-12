@@ -32,7 +32,10 @@ app.add_middleware(
 
 USER_AGENT = "MaxyCrawl-API/1.0 (+https://github.com/yudstrz/MaxyCrawl)"
 TIMEOUT_SECONDS = 15
-MAX_SITEMAPS_TO_FETCH = 5  # Prevent Vercel timeout on Hobby plan by reducing max sitemaps
+
+# Detect Vercel environment to adjust limits dynamically
+IS_VERCEL = os.environ.get("VERCEL") == "1"
+MAX_SITEMAPS_TO_FETCH = 5 if IS_VERCEL else 20  # Limit to 5 on Vercel to avoid timeouts, 20 locally
 
 # --- AI & RAG setup ---
 openai_api_key = os.environ.get("OPENAI_API_KEY")
