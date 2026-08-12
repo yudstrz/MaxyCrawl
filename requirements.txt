@@ -1,0 +1,10 @@
+httpx>=0.25.0
+trafilatura>=1.6.0
+lxml>=4.9.0
+tqdm>=4.66.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+openai
+python-dotenv
+numpy
+tiktoken

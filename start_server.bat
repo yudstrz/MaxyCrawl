@@ -1,0 +1,6 @@
+@echo off
+echo Menginstall dependensi jika belum ada...
+python -m pip install -r requirements.txt
+echo Menjalankan MaxyCrawl Server...
+python -m uvicorn api.index:app --reload
+pause
