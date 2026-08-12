@@ -33,9 +33,9 @@ app.add_middleware(
 USER_AGENT = "MaxyCrawl-API/1.0 (+https://github.com/yudstrz/MaxyCrawl)"
 TIMEOUT_SECONDS = 15
 
-# Detect Vercel environment to adjust limits dynamically
-IS_VERCEL = os.environ.get("VERCEL") == "1"
-MAX_SITEMAPS_TO_FETCH = 5 if IS_VERCEL else 20  # Limit to 5 on Vercel to avoid timeouts, 20 locally
+# Limit to 20 sitemaps to prevent Vercel Hobby timeout.
+# We fetch them concurrently so 20 is safe for the 10s limit.
+MAX_SITEMAPS_TO_FETCH = 20
 
 # --- AI & RAG setup ---
 openai_api_key = os.environ.get("OPENAI_API_KEY")
@@ -163,39 +163,42 @@ async def discover_sitemap(url: str = Query(..., description="The base URL of th
     all_page_urls = set()
     queue = sitemap_urls.copy()
     
-    # BFS to fetch sitemaps
+    # BFS to fetch sitemaps concurrently in batches
     async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS, follow_redirects=True) as client:
         while queue and len(visited_sitemaps) < MAX_SITEMAPS_TO_FETCH:
-            current_sitemap = queue.pop(0)
-            if current_sitemap in visited_sitemaps:
-                continue
-                
-            visited_sitemaps.add(current_sitemap)
+            # Take up to 10 URLs from the queue to process concurrently
+            batch = queue[:10]
+            queue = queue[10:]
             
-            try:
-                resp = await client.get(current_sitemap, headers={"User-Agent": USER_AGENT})
-                if resp.status_code != 200:
-                    continue
-                    
+            async def fetch_sitemap(url):
+                if url in visited_sitemaps: return
+                visited_sitemaps.add(url)
                 try:
-                    root = etree.fromstring(resp.content)
-                    tag = root.tag
-                    ns = "http://www.sitemaps.org/schemas/sitemap/0.9"
+                    resp = await client.get(url, headers={"User-Agent": USER_AGENT})
+                    if resp.status_code != 200: return
                     
-                    if "sitemapindex" in tag:
-                        for sitemap_elem in root.iter(f"{{{ns}}}sitemap"):
-                            loc = sitemap_elem.find(f"{{{ns}}}loc")
-                            if loc is not None and loc.text:
-                                queue.append(loc.text.strip())
-                    else:
-                        for url_elem in root.iter(f"{{{ns}}}url"):
-                            loc = url_elem.find(f"{{{ns}}}loc")
-                            if loc is not None and loc.text:
-                                all_page_urls.add(loc.text.strip())
-                except etree.XMLSyntaxError:
+                    try:
+                        root = etree.fromstring(resp.content)
+                        tag = root.tag
+                        ns = "http://www.sitemaps.org/schemas/sitemap/0.9"
+                        
+                        if "sitemapindex" in tag:
+                            for sitemap_elem in root.iter(f"{{{ns}}}sitemap"):
+                                loc = sitemap_elem.find(f"{{{ns}}}loc")
+                                if loc is not None and loc.text:
+                                    queue.append(loc.text.strip())
+                        else:
+                            for url_elem in root.iter(f"{{{ns}}}url"):
+                                loc = url_elem.find(f"{{{ns}}}loc")
+                                if loc is not None and loc.text:
+                                    all_page_urls.add(loc.text.strip())
+                    except etree.XMLSyntaxError:
+                        pass
+                except Exception:
                     pass
-            except Exception:
-                pass
+
+            # Run batch concurrently
+            await asyncio.gather(*(fetch_sitemap(u) for u in batch))
 
     return SitemapResponse(
         base_url=base_url,
