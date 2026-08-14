@@ -8,3 +8,4 @@ openai
 python-dotenv
 numpy
 tiktoken
+libsql-client

@@ -1,26 +1,41 @@
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Query, Path
+from fastapi.responses import HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 import trafilatura
 from lxml import etree
 from datetime import datetime, timezone
-from urllib.parse import urljoin
 import asyncio
 import os
 from dotenv import load_dotenv
 import numpy as np
 import tiktoken
 from openai import AsyncOpenAI
+from api.database import (
+    init_db, 
+    create_notebook, 
+    get_notebooks, 
+    add_or_update_source, 
+    get_sources, 
+    get_notebook_content, 
+    log_chat,
+    delete_source,
+    delete_notebook,
+    get_source_detail
+)
 
 load_dotenv()
 
 app = FastAPI(
-    title="MaxyCrawl API",
-    description="On-demand web scraper API for knowledge bases.",
-    version="1.0.0"
+    title="MaxyCrawl NotebookLM-Style API",
+    description="RAG Knowledge Base & Website Crawling System",
+    version="2.1.0"
 )
+
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,12 +45,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-USER_AGENT = "MaxyCrawl-API/1.0 (+https://github.com/yudstrz/MaxyCrawl)"
+USER_AGENT = "MaxyCrawl-API/2.1 (+https://github.com/yudstrz/MaxyCrawl)"
 TIMEOUT_SECONDS = 15
-
-# Limit to 20 sitemaps to prevent Vercel Hobby timeout.
-# We fetch them concurrently so 20 is safe for the 10s limit.
-MAX_SITEMAPS_TO_FETCH = 20
+MAX_SITEMAPS_TO_FETCH = 30
 
 # --- AI & RAG setup ---
 openai_api_key = os.environ.get("OPENAI_API_KEY")
@@ -43,7 +55,6 @@ openai_client = AsyncOpenAI(api_key=openai_api_key) if openai_api_key else None
 
 class ChatRequest(BaseModel):
     query: str
-    context_items: list[dict] = []
 
 class ChatResponse(BaseModel):
     answer: str
@@ -60,23 +71,17 @@ def chunk_text(text: str, max_tokens: int = 500) -> list[str]:
         chunks.append(encoding.decode(chunk_tokens))
     return chunks
 
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat_with_data(req: ChatRequest):
+@app.post("/api/notebooks/{notebook_id}/chat", response_model=ChatResponse)
+async def chat_with_notebook(notebook_id: int, req: ChatRequest):
     if not openai_client:
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
-    if not req.context_items:
-        return ChatResponse(answer="No data has been scraped yet. Please extract data first.")
+        raise HTTPException(status_code=500, detail="OpenAI API key belum dikonfigurasi di .env")
         
-    # 1. Prepare and Chunk Context
-    chunks = []
-    for item in req.context_items:
-        text = f"Title: {item.get('title', '')}\nURL: {item.get('url', '')}\nContent: {item.get('content', '')}"
-        item_chunks = chunk_text(text, max_tokens=500)
-        chunks.extend(item_chunks)
+    full_content = await get_notebook_content(notebook_id)
+    if not full_content.strip():
+        return ChatResponse(answer="Notebook ini belum memiliki dokumen atau data yang berhasil diimpor. Silakan tambahkan sumber pengetahuan terlebih dahulu.")
         
-    if not chunks:
-        return ChatResponse(answer="The scraped data is empty.")
-        
+    chunks = chunk_text(full_content, max_tokens=500)
+    
     # 2. Embed query
     query_response = await openai_client.embeddings.create(
         input=req.query,
@@ -84,8 +89,8 @@ async def chat_with_data(req: ChatRequest):
     )
     query_vector = np.array(query_response.data[0].embedding, dtype=np.float32)
     
-    # 3. Limit chunks to avoid extreme timeouts/costs on Vercel
-    chunks = chunks[:50] 
+    # 3. Limit chunks to avoid extreme timeouts/costs
+    chunks = chunks[:100] 
     
     embeddings = []
     batch_size = 50
@@ -107,129 +112,89 @@ async def chat_with_data(req: ChatRequest):
     similarities.sort(key=lambda x: x[0], reverse=True)
     top_chunks = [item[1] for item in similarities[:5]]
     
-    # 3. Generate Answer
+    # 5. Generate Answer
     context = "\n\n---\n\n".join(top_chunks)
-    prompt = f"You are a helpful assistant answering questions based on the provided context.\n\nContext:\n{context}\n\nQuestion: {req.query}\n\nAnswer:"
+    prompt = f"Anda adalah Asisten Pengetahuan spesifik untuk Notebook ini. Anda harus menjawab pertanyaan secara akurat HANYA berdasarkan konteks yang diberikan.\n\nKonteks Sumber Data:\n{context}\n\nPertanyaan: {req.query}\n\nJawaban:"
     
     completion = await openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "You are a helpful AI that answers questions accurately based ONLY on the provided scraped website context. Jika pengguna hanya menyapa (seperti 'hai' atau 'halo'), sapa kembali dengan ramah dan tanyakan apa yang ingin mereka ketahui dari data ini. Jika jawaban tidak ada di konteks, sampaikan dengan sopan bahwa informasi tersebut tidak tersedia di Knowledge Base saat ini. PENTING: Selalu gunakan Bahasa Indonesia dalam menjawab, kecuali pengguna bertanya dalam bahasa lain."},
+            {"role": "system", "content": "Anda adalah Asisten Pengetahuan MaxyCrawl. Jawablah pertanyaan dengan ramah, jelas, dan akurat berdasarkan konteks dokumen yang diberikan. Jika informasi tidak ada di dalam konteks dokumen, katakan 'Maaf, informasi tersebut tidak ditemukan dalam sumber pengetahuan Notebook ini.' dan jangan mengarang informasi. Gunakan Bahasa Indonesia kecuali pengguna bertanya dalam bahasa lain."},
             {"role": "user", "content": prompt}
         ]
     )
     
-    return ChatResponse(answer=completion.choices[0].message.content)
-
-# --- End AI & RAG setup ---
-
-class ScrapeResponse(BaseModel):
-    url: str
-    title: str
-    language: str
-    content: str
-    scraped_at: str
-    status: str
-    error: str = ""
-
-class SitemapResponse(BaseModel):
-    base_url: str
-    total_urls: int
-    urls: list[str]
-    error: str = ""
-
-@app.get("/api/sitemap", response_model=SitemapResponse)
-async def discover_sitemap(url: str = Query(..., description="The base URL of the website")):
-    base_url = url.rstrip("/")
-    sitemap_urls = []
+    answer = completion.choices[0].message.content
+    await log_chat(notebook_id, req.query, answer)
     
-    # 1. Check robots.txt
-    robots_url = f"{base_url}/robots.txt"
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
-            resp = await client.get(robots_url, headers={"User-Agent": USER_AGENT})
-            if resp.status_code == 200:
-                for line in resp.text.splitlines():
-                    if line.strip().lower().startswith("sitemap:"):
-                        sitemap_url = line.split(":", 1)[1].strip()
-                        sitemap_urls.append(sitemap_url)
-    except Exception:
-        pass
+    return ChatResponse(answer=answer)
 
-    if not sitemap_urls:
-        sitemap_urls.append(f"{base_url}/sitemap.xml")
+# --- NOTEBOOK API ---
+class NotebookCreate(BaseModel):
+    name: str
 
-    visited_sitemaps = set()
-    all_page_urls = set()
-    queue = sitemap_urls.copy()
-    
-    # BFS to fetch sitemaps concurrently in batches
-    async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS, follow_redirects=True) as client:
-        while queue and len(visited_sitemaps) < MAX_SITEMAPS_TO_FETCH:
-            # Take up to 10 URLs from the queue to process concurrently
-            batch = queue[:10]
-            queue = queue[10:]
-            
-            async def fetch_sitemap(url):
-                if url in visited_sitemaps: return
-                visited_sitemaps.add(url)
-                try:
-                    resp = await client.get(url, headers={"User-Agent": USER_AGENT})
-                    if resp.status_code != 200: return
-                    
-                    try:
-                        root = etree.fromstring(resp.content)
-                        tag = root.tag
-                        ns = "http://www.sitemaps.org/schemas/sitemap/0.9"
-                        
-                        if "sitemapindex" in tag:
-                            for sitemap_elem in root.iter(f"{{{ns}}}sitemap"):
-                                loc = sitemap_elem.find(f"{{{ns}}}loc")
-                                if loc is not None and loc.text:
-                                    queue.append(loc.text.strip())
-                        else:
-                            for url_elem in root.iter(f"{{{ns}}}url"):
-                                loc = url_elem.find(f"{{{ns}}}loc")
-                                if loc is not None and loc.text:
-                                    all_page_urls.add(loc.text.strip())
-                    except etree.XMLSyntaxError:
-                        pass
-                except Exception:
-                    pass
+@app.get("/api/notebooks")
+async def list_notebooks():
+    return await get_notebooks()
 
-            # Run batch concurrently
-            await asyncio.gather(*(fetch_sitemap(u) for u in batch))
+@app.post("/api/notebooks")
+async def create_new_notebook(data: NotebookCreate):
+    notebook = await create_notebook(data.name)
+    if not notebook:
+        raise HTTPException(status_code=500, detail="Gagal membuat notebook")
+    return notebook
 
-    return SitemapResponse(
-        base_url=base_url,
-        total_urls=len(all_page_urls),
-        urls=list(all_page_urls)
-    )
+@app.delete("/api/notebooks/{notebook_id}")
+async def remove_notebook(notebook_id: int):
+    success = await delete_notebook(notebook_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Gagal menghapus notebook")
+    return {"status": "success", "message": "Notebook berhasil dihapus"}
 
-@app.get("/api/scrape", response_model=ScrapeResponse)
-async def scrape_url(url: str = Query(..., description="The full URL to scrape")):
-    scraped_at = datetime.now(timezone.utc).isoformat()
+@app.get("/api/notebooks/{notebook_id}/sources")
+async def list_notebook_sources(notebook_id: int):
+    return await get_sources(notebook_id)
+
+@app.get("/api/notebooks/{notebook_id}/sources/{source_id}")
+async def get_source(notebook_id: int, source_id: int):
+    detail = await get_source_detail(source_id, notebook_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Dokumen tidak ditemukan")
+    return detail
+
+@app.delete("/api/notebooks/{notebook_id}/sources/{source_id}")
+async def remove_source(notebook_id: int, source_id: int):
+    success = await delete_source(source_id, notebook_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Gagal menghapus dokumen")
+    return {"status": "success", "message": "Dokumen berhasil dihapus"}
+
+@app.post("/api/notebooks/{notebook_id}/scrape")
+async def scrape_to_notebook(notebook_id: int, url: str = Query(...)):
+    url = url.strip()
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS, follow_redirects=True) as client:
             response = await client.get(url, headers={"User-Agent": USER_AGENT})
             response.raise_for_status()
             html = response.text
-    except httpx.HTTPStatusError as e:
-        return ScrapeResponse(url=url, title="", language="", content="", scraped_at=scraped_at, status="failed", error=f"HTTP Error: {e.response.status_code}")
     except Exception as e:
-        return ScrapeResponse(url=url, title="", language="", content="", scraped_at=scraped_at, status="failed", error=f"Failed to fetch URL: {str(e)}")
+        await add_or_update_source(notebook_id, url, "", "", "failed")
+        return {"url": url, "status": "failed", "error": str(e)}
 
-    title, language, content, status, error = "", "", "", "pending", ""
+    title, content, status = "", "", "pending"
     metadata = trafilatura.extract_metadata(html, default_url=url)
-    if metadata:
-        title, language = metadata.title or "", metadata.language or ""
+    if metadata and metadata.title:
+        title = metadata.title.strip()
 
     extracted = trafilatura.extract(
         html, url=url, include_tables=True, include_links=False, 
         include_images=False, output_format="markdown", deduplicate=True
     )
-    if extracted:
-        content, status = extracted, "success"
+    if extracted and extracted.strip():
+        content, status = extracted.strip(), "success"
     else:
         try:
             tree = etree.HTML(html.encode("utf-8"))
@@ -239,407 +204,1379 @@ async def scrape_url(url: str = Query(..., description="The full URL to scrape")
                     title = title_nodes[0].strip()
         except Exception:
             pass
-        status, error = "failed", "trafilatura returned no content"
+        status = "failed" if not content else "success"
 
-    return ScrapeResponse(url=url, title=title, language=language, content=content, scraped_at=scraped_at, status=status, error=error)
+    if not title:
+        title = url
 
+    await add_or_update_source(notebook_id, url, title, content, status)
+    return {"url": url, "title": title, "status": status}
+
+class SitemapResponse(BaseModel):
+    base_url: str
+    total_urls: int
+    urls: list[str]
+
+@app.get("/api/sitemap", response_model=SitemapResponse)
+async def discover_sitemap(url: str = Query(...)):
+    raw_url = url.strip()
+    if not raw_url.startswith("http://") and not raw_url.startswith("https://"):
+        raw_url = "https://" + raw_url
+        
+    base_url = raw_url.rstrip("/")
+    sitemap_urls = []
+    
+    # 1. Check robots.txt
+    robots_url = f"{base_url}/robots.txt"
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS, follow_redirects=True) as client:
+            resp = await client.get(robots_url, headers={"User-Agent": USER_AGENT})
+            if resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    if line.strip().lower().startswith("sitemap:"):
+                        s_url = line.split(":", 1)[1].strip()
+                        if s_url:
+                            sitemap_urls.append(s_url)
+    except Exception:
+        pass
+
+    # 2. Add common standard sitemap paths as fallbacks
+    common_fallbacks = [
+        f"{base_url}/sitemap.xml",
+        f"{base_url}/sitemap_index.xml",
+        f"{base_url}/wp-sitemap.xml"
+    ]
+    for fb in common_fallbacks:
+        if fb not in sitemap_urls:
+            sitemap_urls.append(fb)
+
+    visited_sitemaps = set()
+    all_page_urls = set()
+    queue = sitemap_urls.copy()
+    
+    async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS, follow_redirects=True) as client:
+        while queue and len(visited_sitemaps) < MAX_SITEMAPS_TO_FETCH:
+            batch = queue[:10]
+            queue = queue[10:]
+            
+            async def fetch_sitemap(u):
+                if u in visited_sitemaps: return
+                visited_sitemaps.add(u)
+                try:
+                    resp = await client.get(u, headers={"User-Agent": USER_AGENT})
+                    if resp.status_code != 200: return
+                    try:
+                        root = etree.fromstring(resp.content)
+                        ns = "http://www.sitemaps.org/schemas/sitemap/0.9"
+                        if "sitemapindex" in root.tag:
+                            for sitemap_elem in root.iter(f"{{{ns}}}sitemap"):
+                                loc = sitemap_elem.find(f"{{{ns}}}loc")
+                                if loc is not None and loc.text:
+                                    queue.append(loc.text.strip())
+                        else:
+                            for url_elem in root.iter(f"{{{ns}}}url"):
+                                loc = url_elem.find(f"{{{ns}}}loc")
+                                if loc is not None and loc.text:
+                                    page_link = loc.text.strip()
+                                    if page_link:
+                                        all_page_urls.add(page_link)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            await asyncio.gather(*(fetch_sitemap(u) for u in batch))
+
+    # If sitemap found nothing, at least return the base url
+    if not all_page_urls:
+        all_page_urls.add(base_url)
+
+    url_list = sorted(list(all_page_urls))
+    return SitemapResponse(base_url=base_url, total_urls=len(url_list), urls=url_list)
+
+# --- UI TEMPLATE ---
 @app.get("/", response_class=HTMLResponse)
 def read_root():
     return """
     <!DOCTYPE html>
-    <html lang="en">
+    <html lang="id">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>MaxyCrawl - Extract & Chat</title>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+        <title>MaxyCrawl - AI Knowledge Assistant</title>
+        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
         <style>
             :root {
-                --primary: #4F46E5; --primary-hover: #4338CA;
-                --bg: #0F172A; --surface: #1E293B; --surface-hover: #334155;
-                --text: #F8FAFC; --text-muted: #94A3B8; --border: #334155;
-                --success: #10B981; --error: #EF4444;
+                --bg-base: #090d16;
+                --bg-sidebar: #0e1424;
+                --bg-card: #151d30;
+                --bg-card-hover: #1e2942;
+                --bg-input: #101728;
+                --border: #222f4c;
+                --border-focus: #4f46e5;
+                --primary: #6366f1;
+                --primary-hover: #4f46e5;
+                --primary-subtle: rgba(99, 102, 241, 0.12);
+                --text-main: #f8fafc;
+                --text-muted: #94a3b8;
+                --text-dim: #64748b;
+                --success: #10b981;
+                --success-bg: rgba(16, 185, 129, 0.15);
+                --error: #ef4444;
+                --error-bg: rgba(239, 68, 68, 0.15);
+                --warning: #f59e0b;
             }
             * { box-sizing: border-box; margin: 0; padding: 0; }
-            body { font-family: 'Inter', sans-serif; background-color: var(--bg); color: var(--text); padding: 3rem 1rem; }
-            .container { max-width: 900px; margin: 0 auto; }
-            header { text-align: center; margin-bottom: 2rem; }
-            h1 { font-size: 2.5rem; font-weight: 700; background: linear-gradient(to right, #818CF8, #C084FC); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 0.5rem; }
+            body {
+                font-family: 'Plus Jakarta Sans', sans-serif;
+                background-color: var(--bg-base);
+                color: var(--text-main);
+                height: 100vh;
+                display: flex;
+                overflow: hidden;
+            }
             
-            .card { background: var(--surface); border: 1px solid var(--border); border-radius: 1rem; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }
+            /* Sidebar */
+            .sidebar {
+                width: 280px;
+                background: var(--bg-sidebar);
+                border-right: 1px solid var(--border);
+                display: flex;
+                flex-direction: column;
+                padding: 1.25rem 1rem;
+                flex-shrink: 0;
+            }
+            .brand {
+                font-size: 1.15rem;
+                font-weight: 700;
+                color: #a5b4fc;
+                display: flex;
+                align-items: center;
+                gap: 0.6rem;
+                margin-bottom: 1.25rem;
+                padding: 0 0.5rem;
+            }
+            .brand-badge {
+                font-size: 0.65rem;
+                background: var(--primary);
+                color: white;
+                padding: 0.15rem 0.4rem;
+                border-radius: 0.25rem;
+                font-weight: 700;
+                letter-spacing: 0.05em;
+            }
+            .notebook-list {
+                flex: 1;
+                overflow-y: auto;
+                display: flex;
+                flex-direction: column;
+                gap: 0.35rem;
+                margin-top: 0.5rem;
+            }
+            .notebook-item {
+                padding: 0.7rem 0.85rem;
+                border-radius: 0.5rem;
+                cursor: pointer;
+                font-weight: 500;
+                font-size: 0.9rem;
+                color: var(--text-muted);
+                transition: all 0.15s;
+                border: 1px solid transparent;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 0.5rem;
+            }
+            .notebook-item:hover {
+                background: var(--bg-card);
+                color: var(--text-main);
+            }
+            .notebook-item.active {
+                background: var(--bg-card);
+                color: #e0e7ff;
+                border-color: var(--primary);
+                font-weight: 600;
+            }
+            .notebook-name {
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                flex: 1;
+            }
+            .btn-delete-nb {
+                opacity: 0;
+                background: transparent;
+                border: none;
+                color: var(--text-dim);
+                cursor: pointer;
+                padding: 0.2rem;
+                border-radius: 0.25rem;
+                font-size: 0.85rem;
+                transition: all 0.15s;
+            }
+            .notebook-item:hover .btn-delete-nb {
+                opacity: 1;
+            }
+            .btn-delete-nb:hover {
+                color: var(--error);
+                background: var(--error-bg);
+            }
             
-            /* Tabs */
-            .tabs { display: flex; gap: 1rem; border-bottom: 1px solid var(--border); margin-bottom: 1.5rem; }
-            .tab-btn { background: none; border: none; color: var(--text-muted); padding: 0.75rem 1.5rem; font-weight: 600; cursor: pointer; border-bottom: 2px solid transparent; }
-            .tab-btn.active { color: var(--primary); border-bottom-color: var(--primary); }
-            .tab-content { display: none; }
-            .tab-content.active { display: block; }
+            /* Main Content Area */
+            .main-content {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                height: 100%;
+                overflow: hidden;
+            }
+            .empty-state {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                height: 100%;
+                color: var(--text-muted);
+                text-align: center;
+                padding: 2rem;
+            }
+            .empty-state h2 {
+                font-size: 1.5rem;
+                color: var(--text-main);
+                margin-bottom: 0.5rem;
+            }
             
-            .input-group { display: flex; gap: 0.5rem; }
-            input[type="url"], input[type="text"] { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 0.75rem 1rem; border-radius: 0.5rem; outline: none; }
-            input[type="url"]:focus, input[type="text"]:focus { border-color: var(--primary); }
+            /* Workspace */
+            .workspace {
+                display: none;
+                flex-direction: column;
+                height: 100%;
+                overflow: hidden;
+            }
+            .workspace.active { display: flex; }
             
-            button { background: var(--primary); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 0.5rem; font-weight: 600; cursor: pointer; transition: 0.2s; display: flex; align-items: center; justify-content: center; gap: 0.5rem; }
-            button:hover:not(:disabled) { background: var(--primary-hover); }
-            button:disabled { opacity: 0.5; cursor: not-allowed; }
+            .workspace-header {
+                padding: 1.25rem 2rem;
+                border-bottom: 1px solid var(--border);
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                background: var(--bg-sidebar);
+            }
+            .workspace-title-area h2 {
+                font-size: 1.35rem;
+                font-weight: 700;
+                display: flex;
+                align-items: center;
+                gap: 0.75rem;
+            }
+            .status-pill {
+                font-size: 0.75rem;
+                font-weight: 600;
+                padding: 0.2rem 0.6rem;
+                border-radius: 1rem;
+                background: var(--primary-subtle);
+                color: #a5b4fc;
+                border: 1px solid rgba(99, 102, 241, 0.3);
+            }
             
-            .hidden { display: none !important; }
+            .workspace-tabs {
+                display: flex;
+                gap: 1.5rem;
+                padding: 0 2rem;
+                border-bottom: 1px solid var(--border);
+                background: var(--bg-sidebar);
+            }
+            .tab-btn {
+                padding: 0.85rem 0.25rem;
+                background: transparent;
+                border: none;
+                color: var(--text-muted);
+                font-weight: 600;
+                font-size: 0.925rem;
+                cursor: pointer;
+                border-bottom: 2px solid transparent;
+                transition: all 0.2s;
+                display: flex;
+                align-items: center;
+                gap: 0.5rem;
+            }
+            .tab-btn.active {
+                color: #818cf8;
+                border-bottom-color: var(--primary);
+            }
+            .tab-badge {
+                font-size: 0.75rem;
+                padding: 0.1rem 0.45rem;
+                border-radius: 1rem;
+                background: var(--bg-card);
+                color: var(--text-muted);
+            }
             
-            /* Sitemap List Styles */
-            .list-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); }
-            .sitemap-list { max-height: 400px; overflow-y: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.5rem; }
+            .tab-content {
+                flex: 1;
+                overflow: hidden;
+                display: none;
+            }
+            .tab-content.active { display: flex; }
             
-            .url-item { display: flex; align-items: center; padding: 0.5rem; border-bottom: 1px solid var(--border); font-size: 0.875rem; gap: 0.75rem; }
-            .url-item:last-child { border-bottom: none; }
-            .url-item input[type="checkbox"] { width: 1rem; height: 1rem; cursor: pointer; }
-            .url-item label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; color: var(--text-muted); }
+            /* Sources Section */
+            .sources-view {
+                flex: 1;
+                padding: 1.75rem 2rem;
+                overflow-y: auto;
+                display: flex;
+                flex-direction: column;
+                gap: 1.5rem;
+            }
             
-            .status-badge { padding: 0.2rem 0.5rem; border-radius: 0.25rem; font-size: 0.7rem; font-weight: 600; }
-            .status-pending { background: #475569; color: white; }
-            .status-success { background: rgba(16, 185, 129, 0.2); color: var(--success); }
-            .status-failed { background: rgba(239, 68, 68, 0.2); color: var(--error); }
+            /* Add Sources Box */
+            .add-source-card {
+                background: var(--bg-card);
+                border: 1px solid var(--border);
+                border-radius: 0.85rem;
+                padding: 1.25rem 1.5rem;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+            }
+            .add-source-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 1rem;
+            }
+            .add-source-tabs {
+                display: flex;
+                gap: 0.5rem;
+                background: var(--bg-input);
+                padding: 0.25rem;
+                border-radius: 0.5rem;
+                border: 1px solid var(--border);
+            }
+            .source-mode-btn {
+                padding: 0.45rem 0.9rem;
+                border-radius: 0.35rem;
+                font-size: 0.825rem;
+                font-weight: 600;
+                background: transparent;
+                border: none;
+                color: var(--text-muted);
+                cursor: pointer;
+                transition: all 0.15s;
+            }
+            .source-mode-btn.active {
+                background: var(--primary);
+                color: white;
+            }
             
-            .progress-container { margin-top: 1.5rem; }
-            .progress-bar-bg { width: 100%; height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; margin-top: 0.5rem; }
-            .progress-bar-fill { height: 100%; background: var(--primary); width: 0%; transition: width 0.3s; }
+            .source-input-row {
+                display: flex;
+                gap: 0.75rem;
+            }
+            input[type="text"], input[type="url"] {
+                flex: 1;
+                background: var(--bg-input);
+                border: 1px solid var(--border);
+                padding: 0.75rem 1rem;
+                border-radius: 0.5rem;
+                color: var(--text-main);
+                font-family: inherit;
+                font-size: 0.9rem;
+                transition: border-color 0.2s;
+            }
+            input[type="text"]:focus, input[type="url"]:focus {
+                outline: none;
+                border-color: var(--primary);
+            }
             
-            .json-result { background: #0f172a; padding: 1rem; border-radius: 0.5rem; margin-top: 1rem; font-family: monospace; font-size: 0.8rem; overflow-x: auto; max-height: 200px; }
+            .btn {
+                background: var(--primary);
+                color: white;
+                border: none;
+                padding: 0.75rem 1.25rem;
+                border-radius: 0.5rem;
+                font-weight: 600;
+                font-size: 0.9rem;
+                cursor: pointer;
+                transition: all 0.2s;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 0.5rem;
+                white-space: nowrap;
+            }
+            .btn:hover { background: var(--primary-hover); }
+            .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+            .btn-secondary {
+                background: var(--bg-input);
+                border: 1px solid var(--border);
+                color: var(--text-muted);
+            }
+            .btn-secondary:hover {
+                background: var(--bg-card-hover);
+                color: var(--text-main);
+            }
+            .btn-danger {
+                background: var(--error-bg);
+                color: var(--error);
+                border: 1px solid rgba(239, 68, 68, 0.3);
+            }
+            .btn-danger:hover {
+                background: var(--error);
+                color: white;
+            }
             
-            /* Chat UI */
-            .chat-window { background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem; height: 500px; display: flex; flex-direction: column; }
-            .chat-messages { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; }
-            .chat-message { padding: 0.75rem 1rem; border-radius: 0.5rem; max-width: 85%; line-height: 1.5; font-size: 0.95rem; }
-            .msg-user { background: var(--primary); color: white; align-self: flex-end; border-bottom-right-radius: 0; }
-            .msg-ai { background: var(--surface-hover); color: var(--text); align-self: flex-start; border-bottom-left-radius: 0; white-space: pre-wrap; }
-            .chat-input-area { display: flex; padding: 1rem; border-top: 1px solid var(--border); gap: 0.5rem; }
+            /* Quick Select Presets / Chips */
+            .quick-select-bar {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0.4rem;
+                align-items: center;
+                margin-bottom: 0.75rem;
+                padding: 0.5rem 0.75rem;
+                background: rgba(16, 23, 40, 0.6);
+                border: 1px solid var(--border);
+                border-radius: 0.5rem;
+            }
+            .preset-label {
+                font-size: 0.75rem;
+                font-weight: 600;
+                color: var(--text-dim);
+                margin-right: 0.25rem;
+            }
+            .preset-chip {
+                padding: 0.25rem 0.55rem;
+                background: var(--bg-card);
+                border: 1px solid #2a3754;
+                border-radius: 0.35rem;
+                color: #cbd5e1;
+                font-size: 0.75rem;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.15s;
+            }
+            .preset-chip:hover {
+                background: var(--primary);
+                color: white;
+                border-color: var(--primary);
+            }
+            .preset-chip-active {
+                background: var(--primary);
+                color: white;
+                border-color: var(--primary);
+            }
             
-            /* Spinner */
-            .spinner { width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: white; animation: spin 1s linear infinite; }
-            @keyframes spin { to { transform: rotate(360deg); } }
+            /* Sitemap Discovery Result Panel */
+            .discovery-box {
+                margin-top: 1.25rem;
+                border-top: 1px solid var(--border);
+                padding-top: 1.25rem;
+                display: none;
+            }
+            .discovery-stats {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 0.85rem;
+            }
+            .discovery-tools {
+                display: flex;
+                gap: 0.6rem;
+                margin-bottom: 0.75rem;
+            }
+            .url-list-scroll {
+                max-height: 280px;
+                overflow-y: auto;
+                background: var(--bg-input);
+                border: 1px solid var(--border);
+                border-radius: 0.5rem;
+                padding: 0.35rem;
+            }
+            .url-item {
+                display: flex;
+                align-items: center;
+                gap: 0.75rem;
+                padding: 0.5rem 0.65rem;
+                border-radius: 0.35rem;
+                font-size: 0.825rem;
+                color: var(--text-muted);
+                transition: all 0.15s;
+                cursor: pointer;
+                user-select: none;
+            }
+            .url-item:hover {
+                background: var(--bg-card-hover);
+                color: var(--text-main);
+            }
+            .url-item.selected {
+                background: rgba(99, 102, 241, 0.08);
+                color: #e0e7ff;
+            }
+            .url-item input[type="checkbox"] {
+                accent-color: var(--primary);
+                cursor: pointer;
+                width: 16px;
+                height: 16px;
+            }
+            .url-item label {
+                flex: 1;
+                cursor: pointer;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
             
-            ::-webkit-scrollbar { width: 8px; height: 8px; }
-            ::-webkit-scrollbar-track { background: var(--bg); }
-            ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+            /* Progress Bar */
+            .progress-container {
+                margin-top: 1rem;
+                display: none;
+                background: var(--bg-input);
+                padding: 0.85rem 1rem;
+                border-radius: 0.5rem;
+                border: 1px solid var(--border);
+            }
+            .progress-bar-bg {
+                width: 100%;
+                height: 8px;
+                background: #1e293b;
+                border-radius: 4px;
+                overflow: hidden;
+                margin-top: 0.5rem;
+            }
+            .progress-bar-fill {
+                height: 100%;
+                width: 0%;
+                background: linear-gradient(90deg, #6366f1, #10b981);
+                transition: width 0.2s;
+            }
+            
+            /* Source Items List */
+            .sources-list {
+                display: flex;
+                flex-direction: column;
+                gap: 0.75rem;
+            }
+            .source-card {
+                background: var(--bg-card);
+                border: 1px solid var(--border);
+                border-radius: 0.65rem;
+                padding: 1rem 1.25rem;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                transition: border-color 0.2s;
+            }
+            .source-card:hover {
+                border-color: #3b4d74;
+            }
+            .source-title {
+                font-weight: 600;
+                font-size: 0.95rem;
+                margin-bottom: 0.25rem;
+                color: #e2e8f0;
+            }
+            .source-link {
+                font-size: 0.8rem;
+                color: #818cf8;
+                text-decoration: none;
+                display: inline-block;
+                max-width: 500px;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .source-link:hover { text-decoration: underline; }
+            .source-meta {
+                display: flex;
+                align-items: center;
+                gap: 0.75rem;
+            }
+            .status-badge {
+                font-size: 0.7rem;
+                font-weight: 700;
+                padding: 0.25rem 0.55rem;
+                border-radius: 0.35rem;
+                letter-spacing: 0.05em;
+            }
+            .badge-success { background: var(--success-bg); color: var(--success); }
+            .badge-failed { background: var(--error-bg); color: var(--error); }
+            .badge-pending { background: rgba(245, 158, 11, 0.15); color: var(--warning); }
+            
+            .action-btn-group {
+                display: flex;
+                gap: 0.4rem;
+            }
+            .action-btn {
+                background: var(--bg-input);
+                border: 1px solid var(--border);
+                color: var(--text-muted);
+                padding: 0.35rem 0.65rem;
+                border-radius: 0.35rem;
+                font-size: 0.75rem;
+                cursor: pointer;
+                transition: all 0.15s;
+                font-weight: 500;
+            }
+            .action-btn:hover {
+                background: var(--bg-card-hover);
+                color: var(--text-main);
+                border-color: #475569;
+            }
+            .action-btn-del:hover {
+                background: var(--error-bg);
+                color: var(--error);
+                border-color: var(--error);
+            }
+            
+            /* Chat Section */
+            .chat-view {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                height: 100%;
+                background: var(--bg-base);
+            }
+            .chat-messages {
+                flex: 1;
+                overflow-y: auto;
+                padding: 2rem;
+                display: flex;
+                flex-direction: column;
+                gap: 1.25rem;
+            }
+            .chat-bubble {
+                max-width: 80%;
+                padding: 1rem 1.25rem;
+                border-radius: 0.85rem;
+                line-height: 1.6;
+                font-size: 0.925rem;
+                white-space: pre-wrap;
+            }
+            .bubble-user {
+                background: var(--primary);
+                color: white;
+                align-self: flex-end;
+                border-bottom-right-radius: 0.2rem;
+            }
+            .bubble-ai {
+                background: var(--bg-card);
+                border: 1px solid var(--border);
+                color: #e2e8f0;
+                align-self: flex-start;
+                border-bottom-left-radius: 0.2rem;
+            }
+            .chat-input-container {
+                padding: 1.25rem 2rem;
+                border-top: 1px solid var(--border);
+                background: var(--bg-sidebar);
+            }
+            .chat-form {
+                display: flex;
+                gap: 0.75rem;
+            }
+            
+            /* Modals */
+            .modal-backdrop {
+                position: fixed;
+                top: 0; left: 0; right: 0; bottom: 0;
+                background: rgba(0,0,0,0.75);
+                backdrop-filter: blur(4px);
+                display: none;
+                align-items: center;
+                justify-content: center;
+                z-index: 1000;
+            }
+            .modal-window {
+                background: var(--bg-card);
+                border: 1px solid var(--border);
+                border-radius: 0.85rem;
+                padding: 1.5rem;
+                width: 500px;
+                max-width: 90%;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            }
+            .modal-window h3 {
+                margin-bottom: 0.75rem;
+                font-size: 1.15rem;
+            }
+            .modal-footer {
+                display: flex;
+                justify-content: flex-end;
+                gap: 0.5rem;
+                margin-top: 1.25rem;
+            }
             
             /* Toast Notifications */
-            #toastContainer { position: fixed; bottom: 20px; right: 20px; z-index: 50; display: flex; flex-direction: column; gap: 10px; }
-            .toast { color: white; padding: 1rem 1.5rem; border-radius: 0.5rem; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.5); transform: translateY(100%); opacity: 0; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); min-width: 250px; font-size: 0.9rem; white-space: pre-wrap; }
-            .toast.show { transform: translateY(0); opacity: 1; }
-            .toast-success { background: var(--success); color: #0F172A; font-weight: 600; }
-            .toast-error { background: var(--error); font-weight: 500; }
-            .toast-info { background: var(--primary); font-weight: 500; }
+            #toastBox {
+                position: fixed;
+                bottom: 2rem;
+                right: 2rem;
+                display: flex;
+                flex-direction: column;
+                gap: 0.5rem;
+                z-index: 2000;
+            }
+            .toast-item {
+                padding: 0.75rem 1.25rem;
+                border-radius: 0.5rem;
+                font-size: 0.875rem;
+                background: var(--bg-card);
+                border: 1px solid var(--border);
+                color: var(--text-main);
+                box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+                animation: slideIn 0.25s ease-out;
+            }
+            .toast-success { border-left: 4px solid var(--success); }
+            .toast-error { border-left: 4px solid var(--error); }
+            @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
         </style>
     </head>
     <body>
-        <div class="container">
-            <header>
-                <h1>MaxyCrawl AI</h1>
-                <p style="color: var(--text-muted)">Extract pages in bulk & chat with your knowledge base.</p>
-            </header>
-
-            <div class="card">
-                <div class="tabs">
-                    <button class="tab-btn active" onclick="switchTab('extract')">1. Data Extraction</button>
-                    <button class="tab-btn" onclick="switchTab('knowledge')">2. Test Knowledge (Chat)</button>
-                </div>
-                
-                <!-- EXTRACTION TAB -->
-                <div id="tab-extract" class="tab-content active">
-                    <form id="discoveryForm" class="input-group" style="margin-bottom: 1.5rem;">
-                        <input type="url" id="baseUrl" placeholder="Enter root URL (e.g. https://recruitcrm.io)" required>
-                        <button type="submit" id="discoverBtn">
-                            <span id="discoverText">Discover</span>
-                            <div class="spinner hidden" id="discoverSpinner"></div>
-                        </button>
-                    </form>
-
-                    <div id="resultsCard" class="hidden">
-                        <div class="list-header">
-                            <div>
-                                <h2 style="font-size: 1.25rem;">Discovered URLs</h2>
-                                <p id="urlCount" style="color: var(--text-muted); font-size: 0.875rem; margin-top: 0.25rem;">0 items found</p>
-                            </div>
-                            <div style="display: flex; gap: 1rem;">
-                                <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; cursor: pointer;">
-                                    <input type="checkbox" id="selectAll"> Select All
-                                </label>
-                                <button id="startBtn">Start Scraping</button>
-                            </div>
-                        </div>
-
-                        <div class="sitemap-list" id="urlList"></div>
-
-                        <div id="progressArea" class="progress-container hidden">
-                            <div style="display: flex; justify-content: space-between; font-size: 0.875rem;">
-                                <span>Scraping Progress</span>
-                                <span id="progressText">0 / 0</span>
-                            </div>
-                            <div class="progress-bar-bg">
-                                <div class="progress-bar-fill" id="progressBar"></div>
-                            </div>
-                        </div>
-                        
-                        <div id="jsonArea" class="hidden">
-                            <h3 style="margin-top: 1.5rem; font-size: 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem;">Results</h3>
-                            <textarea id="jsonOutput" class="json-result" style="width: 100%; color: var(--success); resize: vertical;" readonly></textarea>
-                            <div style="display: flex; gap: 1rem; margin-top: 1rem;">
-                                <button id="downloadBtn" style="background: var(--surface-hover);">Download JSONL</button>
-                                <button id="goToChatBtn" style="flex: 1; background: var(--primary); color: white;">
-                                    <span>Go to Chat</span>
-                                </button>
-                            </div>
-                        </div>
+        <!-- Left Sidebar -->
+        <aside class="sidebar">
+            <div class="brand">
+                <span>📚</span> MaxyCrawl LM
+                <span class="brand-badge">PRO</span>
+            </div>
+            
+            <button class="btn" onclick="openNewNotebookModal()">
+                <span>+</span> Notebook Baru
+            </button>
+            
+            <div class="notebook-list" id="notebookList">
+                <!-- Dynamically rendered -->
+            </div>
+        </aside>
+        
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <div class="empty-state" id="emptyState">
+                <h2>Pilih atau Buat Notebook</h2>
+                <p>Notebook adalah ruang kerja pengetahuan untuk mengumpulkan dokumen web dan berdiskusi dengan AI.</p>
+                <button class="btn" style="margin-top: 1.25rem;" onclick="openNewNotebookModal()">+ Buat Notebook Sekarang</button>
+            </div>
+            
+            <div class="workspace" id="workspace">
+                <!-- Header -->
+                <div class="workspace-header">
+                    <div class="workspace-title-area">
+                        <h2 id="workspaceTitle">Judul Notebook</h2>
+                    </div>
+                    <div style="display:flex; align-items:center; gap: 0.75rem;">
+                        <span class="status-pill">🟢 Knowledge Base Aktif</span>
+                        <button class="btn btn-danger" style="padding: 0.45rem 0.75rem; font-size: 0.8rem;" onclick="deleteCurrentNotebook()">Hapus Notebook</button>
                     </div>
                 </div>
                 
-                <!-- KNOWLEDGE TAB -->
-                <div id="tab-knowledge" class="tab-content">
-                    <div class="chat-window">
-                        <div class="chat-messages" id="chatMessages">
-                            <div class="chat-message msg-ai">Hi! I will analyze your scraped data dynamically. Please make sure you have successfully scraped some URLs, then ask me anything!</div>
+                <!-- Tab Headers -->
+                <div class="workspace-tabs">
+                    <button class="tab-btn active" id="btnTabSources" onclick="switchTab('sources')">
+                        📁 Sumber Pengetahuan <span class="tab-badge" id="sourceCountBadge">0</span>
+                    </button>
+                    <button class="tab-btn" id="btnTabChat" onclick="switchTab('chat')">
+                        💬 Tanya Dokumen (AI)
+                    </button>
+                </div>
+                
+                <!-- Tab: Sumber Pengetahuan -->
+                <div class="tab-content active" id="tab-sources">
+                    <div class="sources-view">
+                        
+                        <!-- Panel Tambah Sumber -->
+                        <div class="add-source-card">
+                            <div class="add-source-header">
+                                <h3 style="font-size: 1rem;">Tambah Sumber Pengetahuan Baru</h3>
+                                <div class="add-source-tabs">
+                                    <button class="source-mode-btn active" id="modeSitemapBtn" onclick="setSourceMode('sitemap')">🌐 Seluruh Website (Sitemap)</button>
+                                    <button class="source-mode-btn" id="modeSingleBtn" onclick="setSourceMode('single')">📄 1 Halaman Saja</button>
+                                </div>
+                            </div>
+                            
+                            <!-- Input Row -->
+                            <div class="source-input-row">
+                                <input type="url" id="sourceInputUrl" placeholder="https://recruitcrm.io (Domain atau URL Website)" onkeydown="if(event.key==='Enter') executeAddSource()">
+                                <button class="btn" id="btnAddSourceAction" onclick="executeAddSource()">
+                                    🔍 Temukan Semua Halaman
+                                </button>
+                            </div>
+                            
+                            <!-- Discovery Result Area (untuk mode Sitemap) -->
+                            <div class="discovery-box" id="discoveryBox">
+                                <div class="discovery-stats">
+                                    <div>
+                                        <span style="font-weight: 700; font-size: 1rem; color: #e2e8f0;" id="discoveryCountText">0 Halaman Ditemukan</span>
+                                        <span style="font-size: 0.85rem; color: var(--primary); font-weight: 600; margin-left: 0.5rem;" id="selectedCountBadge">(0 Dipilih)</span>
+                                    </div>
+                                    <button class="btn" id="btnImportSelected" onclick="importSelectedPages()" style="padding: 0.55rem 1.25rem; font-size: 0.875rem;">
+                                        📥 Simpan Halaman Terpilih
+                                    </button>
+                                </div>
+                                
+                                <!-- Quick Selection Preset Chips -->
+                                <div class="quick-select-bar">
+                                    <span class="preset-label">Pilihan Cepat:</span>
+                                    <button class="preset-chip" onclick="applyPresetSelection('all')">✅ Pilih Semua</button>
+                                    <button class="preset-chip" onclick="applyPresetSelection('none')">❌ Kosongkan</button>
+                                    <button class="preset-chip" onclick="applyPresetSelection(10)">10 Teratas</button>
+                                    <button class="preset-chip" onclick="applyPresetSelection(25)">25 Teratas</button>
+                                    <button class="preset-chip" onclick="applyPresetSelection(50)">50 Teratas</button>
+                                    <button class="preset-chip" onclick="applyPresetSelection(100)">100 Teratas</button>
+                                    <button class="preset-chip" onclick="applyKeywordPreset('/blogs/')">Hanya /blogs/</button>
+                                </div>
+                                
+                                <div class="discovery-tools">
+                                    <input type="text" id="urlFilterInput" placeholder="🔍 Ketik untuk menyaring URL (contoh: /blogs/, /case-studies/, /pricing/)..." oninput="filterDiscoveredUrls()" style="padding: 0.5rem 0.85rem; font-size: 0.85rem;">
+                                    <button class="btn btn-secondary" style="padding: 0.5rem 0.85rem; font-size: 0.825rem;" onclick="selectOnlyFilteredUrls()" title="Pilih hanya URL yang saat ini muncul di hasil pencarian">
+                                        Pilih Hasil Filter
+                                    </button>
+                                </div>
+                                
+                                <div class="url-list-scroll" id="discoveryUrlList">
+                                    <!-- URL Checkboxes -->
+                                </div>
+                                
+                                <div class="progress-container" id="progressContainer">
+                                    <div style="display:flex; justify-content:space-between; font-size: 0.85rem; font-weight: 600; color: var(--text-main);">
+                                        <span id="progressStatusText">Menyimpan halaman...</span>
+                                        <span id="progressPercentText" style="color: var(--primary);">0%</span>
+                                    </div>
+                                    <div class="progress-bar-bg">
+                                        <div class="progress-bar-fill" id="progressBarFill"></div>
+                                    </div>
+                                </div>
+                            </div>
+                            
                         </div>
-                        <form id="chatForm" class="chat-input-area">
-                            <input type="text" id="chatInput" placeholder="Ask a question..." required>
-                            <button type="submit" id="chatBtn">
-                                <span id="chatText">Send</span>
-                                <div class="spinner hidden" id="chatSpinner"></div>
-                            </button>
-                        </form>
+                        
+                        <!-- List Sumber Tersimpan -->
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 0.5rem;">
+                            <h3 style="font-size: 1.05rem; font-weight: 600;">Daftar Dokumen Tersimpan</h3>
+                            <button class="btn btn-secondary" style="padding: 0.35rem 0.65rem; font-size: 0.8rem;" onclick="loadSources()">🔄 Refresh Daftar</button>
+                        </div>
+                        
+                        <div class="sources-list" id="sourcesList">
+                            <!-- Dynamically loaded sources -->
+                        </div>
+                        
+                    </div>
+                </div>
+                
+                <!-- Tab: Tanya Dokumen (AI Chat) -->
+                <div class="tab-content" id="tab-chat">
+                    <div class="chat-view">
+                        <div class="chat-messages" id="chatMessages">
+                            <div class="chat-bubble bubble-ai">
+                                Halo! Saya adalah Asisten AI untuk Notebook ini. Saya telah membaca seluruh dokumen yang tersimpan dan siap menjawab pertanyaan Anda secara akurat berdasarkan data tersebut.
+                            </div>
+                        </div>
+                        <div class="chat-input-container">
+                            <form class="chat-form" id="chatForm">
+                                <input type="text" id="chatInput" placeholder="Tanyakan apa saja tentang dokumen dalam notebook ini..." required autocomplete="off">
+                                <button type="submit" class="btn" id="chatSendBtn">Kirim</button>
+                            </form>
+                        </div>
                     </div>
                 </div>
                 
             </div>
+        </main>
+        
+        <!-- Modal: Buat Notebook Baru -->
+        <div class="modal-backdrop" id="modalNewNb">
+            <div class="modal-window">
+                <h3>Buat Notebook Baru</h3>
+                <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">Beri nama untuk topik atau proyek pengetahuan Anda.</p>
+                <input type="text" id="newNbNameInput" placeholder="Contoh: Dokumen Recruit CRM / Riset Pasar" style="width: 100%;" onkeydown="if(event.key==='Enter') submitCreateNotebook()">
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="closeModal('modalNewNb')">Batal</button>
+                    <button class="btn" onclick="submitCreateNotebook()">Buat Notebook</button>
+                </div>
+            </div>
         </div>
-
-        <div id="toastContainer"></div>
+        
+        <!-- Modal: Preview Konten Dokumen -->
+        <div class="modal-backdrop" id="modalPreview">
+            <div class="modal-window" style="width: 750px;">
+                <h3 id="previewTitle">Judul Dokumen</h3>
+                <p style="font-size: 0.8rem; color: var(--primary); margin-bottom: 0.75rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" id="previewUrl"></p>
+                <div id="previewContent" style="max-height: 400px; overflow-y: auto; background: var(--bg-input); border: 1px solid var(--border); padding: 1rem; border-radius: 0.5rem; font-size: 0.85rem; line-height: 1.6; white-space: pre-wrap; color: var(--text-main);">
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="closeModal('modalPreview')">Tutup</button>
+                </div>
+            </div>
+        </div>
+        
+        <div id="toastBox"></div>
 
         <script>
-            function showToast(message, type = 'info') {
-                const container = document.getElementById('toastContainer');
-                const toast = document.createElement('div');
-                toast.className = `toast toast-${type}`;
-                toast.textContent = message;
-                
-                container.appendChild(toast);
-                
-                requestAnimationFrame(() => {
-                    requestAnimationFrame(() => {
-                        toast.classList.add('show');
-                    });
-                });
-                
-                setTimeout(() => {
-                    toast.classList.remove('show');
-                    setTimeout(() => toast.remove(), 300);
-                }, 4000);
+            let currentNbId = null;
+            let currentMode = 'sitemap'; // 'sitemap' atau 'single'
+            let rawDiscoveredUrls = [];
+            let currentFilteredUrls = [];
+            let selectedUrlSet = new Set();
+            
+            function showToast(msg, type='success') {
+                const box = document.getElementById('toastBox');
+                const t = document.createElement('div');
+                t.className = `toast-item toast-${type}`;
+                t.textContent = msg;
+                box.appendChild(t);
+                setTimeout(() => t.remove(), 3500);
             }
-
-            function switchTab(tab) {
-                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            
+            function openNewNotebookModal() {
+                document.getElementById('modalNewNb').style.display = 'flex';
+                setTimeout(() => document.getElementById('newNbNameInput').focus(), 100);
+            }
+            function closeModal(id) {
+                document.getElementById(id).style.display = 'none';
+            }
+            
+            function setSourceMode(mode) {
+                currentMode = mode;
+                const sitemapBtn = document.getElementById('modeSitemapBtn');
+                const singleBtn = document.getElementById('modeSingleBtn');
+                const input = document.getElementById('sourceInputUrl');
+                const actionBtn = document.getElementById('btnAddSourceAction');
+                const discoveryBox = document.getElementById('discoveryBox');
                 
-                if (tab === 'extract') {
-                    document.querySelector('.tab-btn:nth-child(1)').classList.add('active');
-                    document.getElementById('tab-extract').classList.add('active');
+                if (mode === 'sitemap') {
+                    sitemapBtn.classList.add('active');
+                    singleBtn.classList.remove('active');
+                    input.placeholder = "https://recruitcrm.io (Domain atau URL Website)";
+                    actionBtn.innerHTML = "🔍 Temukan Semua Halaman";
                 } else {
-                    document.querySelector('.tab-btn:nth-child(2)').classList.add('active');
-                    document.getElementById('tab-knowledge').classList.add('active');
+                    singleBtn.classList.add('active');
+                    sitemapBtn.classList.remove('active');
+                    input.placeholder = "https://recruitcrm.io/blogs/post-1/ (Tautan 1 Halaman Spesifik)";
+                    actionBtn.innerHTML = "📥 Tambah 1 Halaman";
+                    discoveryBox.style.display = 'none';
                 }
             }
-        
-            let discoveredUrls = [];
-            let scrapedItems = [];
             
-            const form = document.getElementById('discoveryForm');
-            const baseUrlInput = document.getElementById('baseUrl');
-            const discoverBtn = document.getElementById('discoverBtn');
-            const discoverText = document.getElementById('discoverText');
-            const discoverSpinner = document.getElementById('discoverSpinner');
+            async function loadNotebooks() {
+                try {
+                    const res = await fetch('/api/notebooks');
+                    const nbs = await res.json();
+                    const list = document.getElementById('notebookList');
+                    list.innerHTML = '';
+                    if(!nbs || nbs.length === 0) {
+                        list.innerHTML = '<div style="color:var(--text-dim);font-size:0.85rem;padding:0.75rem 0.5rem;text-align:center;">Belum ada notebook</div>';
+                        return;
+                    }
+                    nbs.forEach(nb => {
+                        const item = document.createElement('div');
+                        item.className = `notebook-item ${currentNbId === nb.id ? 'active' : ''}`;
+                        item.innerHTML = `
+                            <span class="notebook-name">📓 ${nb.name}</span>
+                            <button class="btn-delete-nb" title="Hapus Notebook" onclick="event.stopPropagation(); deleteNotebook(${nb.id}, '${nb.name}')">🗑️</button>
+                        `;
+                        item.onclick = () => selectNotebook(nb.id, nb.name);
+                        list.appendChild(item);
+                    });
+                } catch(e) {
+                    console.error("Error loading notebooks", e);
+                }
+            }
             
-            const resultsCard = document.getElementById('resultsCard');
-            const urlList = document.getElementById('urlList');
-            const urlCount = document.getElementById('urlCount');
-            const selectAll = document.getElementById('selectAll');
-            const startBtn = document.getElementById('startBtn');
+            async function submitCreateNotebook() {
+                const input = document.getElementById('newNbNameInput');
+                const name = input.value.trim();
+                if(!name) return;
+                try {
+                    const res = await fetch('/api/notebooks', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({name})
+                    });
+                    if(res.ok) {
+                        const nb = await res.json();
+                        closeModal('modalNewNb');
+                        input.value = '';
+                        await loadNotebooks();
+                        selectNotebook(nb.id, nb.name);
+                        showToast('Notebook baru berhasil dibuat!');
+                    } else {
+                        showToast('Gagal membuat notebook', 'error');
+                    }
+                } catch(e) {
+                    showToast('Kesalahan koneksi', 'error');
+                }
+            }
             
-            const progressArea = document.getElementById('progressArea');
-            const progressBar = document.getElementById('progressBar');
-            const progressText = document.getElementById('progressText');
-            const jsonArea = document.getElementById('jsonArea');
-            const jsonOutput = document.getElementById('jsonOutput');
+            async function deleteNotebook(id, name) {
+                if(!confirm(`Apakah Anda yakin ingin menghapus notebook "${name}" beserta seluruh datanya?`)) return;
+                try {
+                    const res = await fetch(`/api/notebooks/${id}`, { method: 'DELETE' });
+                    if(res.ok) {
+                        showToast('Notebook berhasil dihapus');
+                        if(currentNbId === id) {
+                            currentNbId = null;
+                            document.getElementById('workspace').classList.remove('active');
+                            document.getElementById('emptyState').style.display = 'flex';
+                        }
+                        loadNotebooks();
+                    }
+                } catch(e) {
+                    showToast('Gagal menghapus notebook', 'error');
+                }
+            }
             
-            const goToChatBtn = document.getElementById('goToChatBtn');
-
-            // 1. Discover URLs
-            form.addEventListener('submit', async (e) => {
-                e.preventDefault();
-                const url = baseUrlInput.value;
-                discoverBtn.disabled = true;
-                discoverText.classList.add('hidden');
-                discoverSpinner.classList.remove('hidden');
-                resultsCard.classList.add('hidden');
-                jsonArea.classList.add('hidden');
+            function deleteCurrentNotebook() {
+                if(!currentNbId) return;
+                const title = document.getElementById('workspaceTitle').textContent;
+                deleteNotebook(currentNbId, title);
+            }
+            
+            async function selectNotebook(id, name) {
+                currentNbId = id;
+                document.getElementById('emptyState').style.display = 'none';
+                document.getElementById('workspace').classList.add('active');
+                document.getElementById('workspaceTitle').textContent = name;
+                document.getElementById('discoveryBox').style.display = 'none';
+                loadNotebooks();
+                loadSources();
+                switchTab('sources');
+            }
+            
+            function switchTab(tab) {
+                document.getElementById('btnTabSources').classList.remove('active');
+                document.getElementById('btnTabChat').classList.remove('active');
+                document.getElementById('tab-sources').classList.remove('active');
+                document.getElementById('tab-chat').classList.remove('active');
+                
+                if(tab === 'sources') {
+                    document.getElementById('btnTabSources').classList.add('active');
+                    document.getElementById('tab-sources').classList.add('active');
+                } else {
+                    document.getElementById('btnTabChat').classList.add('active');
+                    document.getElementById('tab-chat').classList.add('active');
+                }
+            }
+            
+            async function loadSources() {
+                if(!currentNbId) return;
+                try {
+                    const res = await fetch(`/api/notebooks/${currentNbId}/sources`);
+                    const sources = await res.json();
+                    const list = document.getElementById('sourcesList');
+                    document.getElementById('sourceCountBadge').textContent = sources.length;
+                    list.innerHTML = '';
+                    
+                    if(sources.length === 0) {
+                        list.innerHTML = `
+                            <div style="background:var(--bg-card); border:1px dashed var(--border); padding:2rem; border-radius:0.65rem; text-align:center; color:var(--text-muted);">
+                                Belum ada sumber pengetahuan di notebook ini.<br>Gunakan form di atas untuk menambahkan dokumen website.
+                            </div>
+                        `;
+                        return;
+                    }
+                    
+                    sources.forEach(s => {
+                        const isOk = s.status === 'success';
+                        const badgeClass = isOk ? 'badge-success' : 'badge-failed';
+                        const badgeText = isOk ? 'TERSIMPAN' : 'GAGAL';
+                        
+                        const item = document.createElement('div');
+                        item.className = 'source-card';
+                        item.innerHTML = `
+                            <div style="flex:1; margin-right:1rem; overflow:hidden;">
+                                <div class="source-title">${s.title || 'Dokumen Tanpa Judul'}</div>
+                                <a href="${s.url}" target="_blank" class="source-link">${s.url}</a>
+                            </div>
+                            <div class="source-meta">
+                                <span class="status-badge ${badgeClass}">${badgeText}</span>
+                                <div class="action-btn-group">
+                                    <button class="action-btn" onclick="previewSource(${s.id})" title="Lihat Isi Dokumen">👁️ Preview</button>
+                                    <button class="action-btn" onclick="reSyncSource('${s.url}')" title="Perbarui Data">🔄 Update</button>
+                                    <button class="action-btn action-btn-del" onclick="deleteSource(${s.id})" title="Hapus Dokumen">🗑️</button>
+                                </div>
+                            </div>
+                        `;
+                        list.appendChild(item);
+                    });
+                } catch(e) {
+                    console.error("Error loading sources", e);
+                }
+            }
+            
+            async function previewSource(sourceId) {
+                try {
+                    const res = await fetch(`/api/notebooks/${currentNbId}/sources/${sourceId}`);
+                    if(!res.ok) throw new Error("Gagal mengambil detail dokumen");
+                    const data = await res.json();
+                    document.getElementById('previewTitle').textContent = data.title || 'Dokumen Tanpa Judul';
+                    document.getElementById('previewUrl').textContent = data.url;
+                    document.getElementById('previewContent').textContent = data.content || '(Dokumen ini kosong atau gagal diekstrak)';
+                    document.getElementById('modalPreview').style.display = 'flex';
+                } catch(e) {
+                    showToast(e.message, 'error');
+                }
+            }
+            
+            async function deleteSource(sourceId) {
+                if(!confirm("Hapus dokumen ini dari notebook?")) return;
+                try {
+                    const res = await fetch(`/api/notebooks/${currentNbId}/sources/${sourceId}`, { method: 'DELETE' });
+                    if(res.ok) {
+                        showToast('Dokumen berhasil dihapus');
+                        loadSources();
+                    }
+                } catch(e) {
+                    showToast('Gagal menghapus dokumen', 'error');
+                }
+            }
+            
+            async function reSyncSource(url) {
+                showToast(`Memperbarui data dari ${url}...`);
+                try {
+                    const res = await fetch(`/api/notebooks/${currentNbId}/scrape?url=${encodeURIComponent(url)}`, { method: 'POST' });
+                    if(res.ok) {
+                        showToast('Dokumen berhasil diperbarui!');
+                        loadSources();
+                    } else {
+                        showToast('Gagal memperbarui dokumen', 'error');
+                    }
+                } catch(e) {
+                    showToast('Kesalahan jaringan', 'error');
+                }
+            }
+            
+            async function executeAddSource() {
+                const url = document.getElementById('sourceInputUrl').value.trim();
+                if(!url) {
+                    showToast('Harap masukkan URL terlebih dahulu', 'error');
+                    return;
+                }
+                
+                if (currentMode === 'single') {
+                    // Single page scrape
+                    const btn = document.getElementById('btnAddSourceAction');
+                    btn.disabled = true;
+                    btn.textContent = "Mengimpor...";
+                    showToast(`Mengambil halaman: ${url}...`);
+                    try {
+                        const res = await fetch(`/api/notebooks/${currentNbId}/scrape?url=${encodeURIComponent(url)}`, { method: 'POST' });
+                        if(res.ok) {
+                            showToast('Halaman berhasil ditambahkan ke notebook!');
+                            document.getElementById('sourceInputUrl').value = '';
+                            loadSources();
+                        } else {
+                            showToast('Gagal mengambil halaman', 'error');
+                        }
+                    } catch(e) {
+                        showToast('Kesalahan jaringan', 'error');
+                    }
+                    btn.disabled = false;
+                    btn.textContent = "📥 Tambah 1 Halaman";
+                } else {
+                    // Sitemap Discovery
+                    discoverSitemapFlow(url);
+                }
+            }
+            
+            async function discoverSitemapFlow(url) {
+                const btn = document.getElementById('btnAddSourceAction');
+                btn.disabled = true;
+                btn.textContent = "Menjelajahi...";
+                showToast(`Menelusuri sitemap dari ${url}...`);
                 
                 try {
                     const res = await fetch(`/api/sitemap?url=${encodeURIComponent(url)}`);
                     const data = await res.json();
-                    discoveredUrls = data.urls || [];
-                    urlCount.textContent = `${discoveredUrls.length} items found`;
-                    renderList();
-                    resultsCard.classList.remove('hidden');
-                } catch (err) {
-                    showToast("Failed to fetch sitemap.", "error");
-                } finally {
-                    discoverBtn.disabled = false;
-                    discoverText.classList.remove('hidden');
-                    discoverSpinner.classList.add('hidden');
-                }
-            });
-
-            function renderList() {
-                urlList.innerHTML = '';
-                discoveredUrls.forEach((url, i) => {
-                    const div = document.createElement('div');
-                    div.className = 'url-item';
-                    div.innerHTML = `
-                        <input type="checkbox" id="chk_${i}" class="url-cb" value="${url}">
-                        <label for="chk_${i}">${url}</label>
-                        <span id="badge_${i}" class="status-badge status-pending">PENDING</span>
-                    `;
-                    urlList.appendChild(div);
-                });
-            }
-
-            selectAll.addEventListener('change', (e) => {
-                document.querySelectorAll('.url-cb').forEach(cb => {
-                    cb.checked = e.target.checked;
-                });
-            });
-
-            // 2. Start Scraping
-            startBtn.addEventListener('click', async () => {
-                const checkboxes = document.querySelectorAll('.url-cb:checked');
-                if (checkboxes.length === 0) return showToast("Select at least 1 URL!", "error");
-                
-                startBtn.disabled = true;
-                selectAll.disabled = true;
-                document.querySelectorAll('.url-cb').forEach(cb => cb.disabled = true);
-                
-                progressArea.classList.remove('hidden');
-                jsonArea.classList.add('hidden');
-                scrapedItems = [];
-                jsonOutput.value = "";
-                
-                const total = checkboxes.length;
-                let done = 0;
-                
-                for (let cb of checkboxes) {
-                    const url = cb.value;
-                    const index = cb.id.split('_')[1];
-                    const badge = document.getElementById(`badge_${index}`);
+                    rawDiscoveredUrls = data.urls || [];
+                    currentFilteredUrls = [...rawDiscoveredUrls];
                     
-                    badge.textContent = "SCRAPING...";
-                    badge.style.background = "var(--primary)";
-                    badge.style.color = "white";
-                    
-                    try {
-                        const res = await fetch(`/api/scrape?url=${encodeURIComponent(url)}`);
-                        const data = await res.json();
-                        
-                        if (data.status === 'success') {
-                            badge.textContent = "SUCCESS";
-                            badge.className = "status-badge status-success";
-                            
-                            const item = {url: data.url, title: data.title, content: data.content};
-                            scrapedItems.push(item);
-                            jsonOutput.value += JSON.stringify(item) + "\\n";
-                        } else {
-                            badge.textContent = "FAILED";
-                            badge.className = "status-badge status-failed";
-                        }
-                    } catch (err) {
-                        badge.textContent = "ERROR";
-                        badge.className = "status-badge status-failed";
+                    // Default select top 50 (or all if < 50) for immediate fast action
+                    selectedUrlSet.clear();
+                    const initialSelectCount = Math.min(50, rawDiscoveredUrls.length);
+                    for (let i = 0; i < initialSelectCount; i++) {
+                        selectedUrlSet.add(rawDiscoveredUrls[i]);
                     }
                     
-                    done++;
-                    progressBar.style.width = `${(done / total) * 100}%`;
-                    progressText.textContent = `${done} / ${total}`;
-                    cb.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    document.getElementById('discoveryBox').style.display = 'block';
+                    document.getElementById('discoveryCountText').textContent = `${rawDiscoveredUrls.length.toLocaleString()} Halaman Ditemukan`;
+                    document.getElementById('urlFilterInput').value = '';
+                    
+                    renderDiscoveredUrls(rawDiscoveredUrls);
+                    showToast(`Berhasil menemukan ${rawDiscoveredUrls.length} halaman! (50 halaman teratas otomatis dipilih)`);
+                } catch(e) {
+                    showToast('Gagal membaca sitemap website', 'error');
                 }
-                
-                startBtn.disabled = false;
-                startBtn.textContent = "Scraping Complete!";
-                jsonArea.classList.remove('hidden');
-            });
-            
-            document.getElementById('downloadBtn').addEventListener('click', () => {
-                const blob = new Blob([jsonOutput.value], { type: 'application/json' });
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = 'combined.jsonl';
-                a.click();
-                window.URL.revokeObjectURL(url);
-            });
-            
-            // 3. Navigate to Chat
-            goToChatBtn.addEventListener('click', () => {
-                if (scrapedItems.length === 0) return showToast("No successfully scraped items! Please scrape first.", "error");
-                showToast("Ready! Your data will be processed on-the-fly when you ask a question.", "success");
-                switchTab('knowledge');
-            });
-            
-            // 4. Chat Flow
-            const chatForm = document.getElementById('chatForm');
-            const chatInput = document.getElementById('chatInput');
-            const chatMessages = document.getElementById('chatMessages');
-            const chatBtn = document.getElementById('chatBtn');
-            const chatText = document.getElementById('chatText');
-            const chatSpinner = document.getElementById('chatSpinner');
-            
-            function appendMessage(role, text) {
-                const div = document.createElement('div');
-                div.className = `chat-message ${role === 'user' ? 'msg-user' : 'msg-ai'}`;
-                div.textContent = text;
-                chatMessages.appendChild(div);
-                chatMessages.scrollTop = chatMessages.scrollHeight;
+                btn.disabled = false;
+                btn.textContent = "🔍 Temukan Semua Halaman";
             }
             
-            chatForm.addEventListener('submit', async (e) => {
+            function renderDiscoveredUrls(urls) {
+                const list = document.getElementById('discoveryUrlList');
+                list.innerHTML = '';
+                if(urls.length === 0) {
+                    list.innerHTML = '<div style="font-size:0.85rem; color:var(--text-dim); padding:1rem; text-align:center;">Tidak ada URL yang cocok dengan filter</div>';
+                    updateSelectionUI();
+                    return;
+                }
+                
+                // Render up to 500 items in virtual DOM
+                urls.slice(0, 500).forEach((u, idx) => {
+                    const isChecked = selectedUrlSet.has(u);
+                    const div = document.createElement('div');
+                    div.className = `url-item ${isChecked ? 'selected' : ''}`;
+                    div.id = `url_row_${idx}`;
+                    div.innerHTML = `
+                        <input type="checkbox" id="url_cb_${idx}" value="${u}" ${isChecked ? 'checked' : ''}>
+                        <label for="url_cb_${idx}" title="${u}">${u}</label>
+                    `;
+                    
+                    // Click on row to toggle selection
+                    div.onclick = (e) => {
+                        if (e.target.tagName !== 'INPUT') {
+                            const cb = div.querySelector('input[type="checkbox"]');
+                            cb.checked = !cb.checked;
+                        }
+                        const isNowChecked = div.querySelector('input[type="checkbox"]').checked;
+                        if (isNowChecked) {
+                            selectedUrlSet.add(u);
+                            div.classList.add('selected');
+                        } else {
+                            selectedUrlSet.delete(u);
+                            div.classList.remove('selected');
+                        }
+                        updateSelectionUI();
+                    };
+                    
+                    list.appendChild(div);
+                });
+                
+                updateSelectionUI();
+            }
+            
+            function filterDiscoveredUrls() {
+                const filter = document.getElementById('urlFilterInput').value.toLowerCase().trim();
+                currentFilteredUrls = rawDiscoveredUrls.filter(u => u.toLowerCase().includes(filter));
+                renderDiscoveredUrls(currentFilteredUrls);
+            }
+            
+            function applyPresetSelection(type) {
+                if (type === 'all') {
+                    rawDiscoveredUrls.forEach(u => selectedUrlSet.add(u));
+                    showToast(`Semua ${rawDiscoveredUrls.length} halaman dipilih`);
+                } else if (type === 'none') {
+                    selectedUrlSet.clear();
+                    showToast('Pilihan dikosongkan');
+                } else if (typeof type === 'number') {
+                    selectedUrlSet.clear();
+                    const count = Math.min(type, rawDiscoveredUrls.length);
+                    for (let i = 0; i < count; i++) {
+                        selectedUrlSet.add(rawDiscoveredUrls[i]);
+                    }
+                    showToast(`${count} halaman teratas dipilih`);
+                }
+                renderDiscoveredUrls(currentFilteredUrls);
+            }
+            
+            function applyKeywordPreset(kw) {
+                document.getElementById('urlFilterInput').value = kw;
+                filterDiscoveredUrls();
+                selectOnlyFilteredUrls();
+            }
+            
+            function selectOnlyFilteredUrls() {
+                if (currentFilteredUrls.length === 0) return;
+                selectedUrlSet.clear();
+                currentFilteredUrls.forEach(u => selectedUrlSet.add(u));
+                renderDiscoveredUrls(currentFilteredUrls);
+                showToast(`${currentFilteredUrls.length} halaman hasil filter dipilih`);
+            }
+            
+            function updateSelectionUI() {
+                const totalSelected = selectedUrlSet.size;
+                const badge = document.getElementById('selectedCountBadge');
+                const btn = document.getElementById('btnImportSelected');
+                
+                badge.textContent = `(${totalSelected.toLocaleString()} Dipilih)`;
+                btn.textContent = `📥 Simpan ${totalSelected.toLocaleString()} Halaman Terpilih`;
+                btn.disabled = totalSelected === 0;
+            }
+            
+            async function importSelectedPages() {
+                const selectedUrls = Array.from(selectedUrlSet);
+                if(selectedUrls.length === 0) return;
+                
+                const total = selectedUrls.length;
+                const progContainer = document.getElementById('progressContainer');
+                const progStatus = document.getElementById('progressStatusText');
+                const progPercent = document.getElementById('progressPercentText');
+                const progFill = document.getElementById('progressBarFill');
+                const btn = document.getElementById('btnImportSelected');
+                
+                progContainer.style.display = 'block';
+                btn.disabled = true;
+                
+                let completed = 0;
+                // Process in concurrent batches of 4
+                const batchSize = 4;
+                for (let i = 0; i < selectedUrls.length; i += batchSize) {
+                    const batch = selectedUrls.slice(i, i + batchSize);
+                    await Promise.all(batch.map(async url => {
+                        try {
+                            await fetch(`/api/notebooks/${currentNbId}/scrape?url=${encodeURIComponent(url)}`, { method: 'POST' });
+                        } catch(e) {}
+                        completed++;
+                        const pct = Math.round((completed / total) * 100);
+                        progFill.style.width = `${pct}%`;
+                        progPercent.textContent = `${pct}%`;
+                        progStatus.textContent = `Menyimpan ${completed} dari ${total} halaman (${pct}%)...`;
+                    }));
+                }
+                
+                showToast(`Selesai menyimpan ${completed} dokumen ke notebook!`);
+                btn.disabled = false;
+                loadSources();
+            }
+            
+            // AI Chat Submission
+            document.getElementById('chatForm').addEventListener('submit', async (e) => {
                 e.preventDefault();
-                const query = chatInput.value.trim();
-                if (!query) return;
+                if(!currentNbId) return;
+                const input = document.getElementById('chatInput');
+                const query = input.value.trim();
+                if(!query) return;
                 
-                appendMessage('user', query);
-                chatInput.value = '';
+                const chatBox = document.getElementById('chatMessages');
+                chatBox.innerHTML += `<div class="chat-bubble bubble-user">${query}</div>`;
+                input.value = '';
+                chatBox.scrollTop = chatBox.scrollHeight;
                 
-                chatBtn.disabled = true;
-                chatText.classList.add('hidden');
-                chatSpinner.classList.remove('hidden');
+                const sendBtn = document.getElementById('chatSendBtn');
+                sendBtn.disabled = true;
+                sendBtn.textContent = "...";
+                
+                // Loading indicator
+                const loadingDiv = document.createElement('div');
+                loadingDiv.className = 'chat-bubble bubble-ai';
+                loadingDiv.textContent = 'Membaca dokumen & menganalisis...';
+                chatBox.appendChild(loadingDiv);
+                chatBox.scrollTop = chatBox.scrollHeight;
                 
                 try {
-                    const res = await fetch('/api/chat', {
+                    const res = await fetch(`/api/notebooks/${currentNbId}/chat`, {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({query: query, context_items: scrapedItems})
+                        body: JSON.stringify({query})
                     });
                     const data = await res.json();
-                    
-                    if (res.ok) {
-                        appendMessage('ai', data.answer);
-                    } else {
-                        appendMessage('ai', `Error: ${data.detail || 'Failed to get answer'}`);
-                    }
-                } catch (err) {
-                    appendMessage('ai', "Error communicating with backend.");
-                } finally {
-                    chatBtn.disabled = false;
-                    chatText.classList.remove('hidden');
-                    chatSpinner.classList.add('hidden');
-                    chatInput.focus();
+                    loadingDiv.textContent = data.answer || data.detail || 'Maaf, terjadi kendala saat memproses respons.';
+                } catch(err) {
+                    loadingDiv.textContent = 'Gagal terhubung ke AI Assistant.';
+                    loadingDiv.style.color = 'var(--error)';
                 }
+                
+                sendBtn.disabled = false;
+                sendBtn.textContent = "Kirim";
+                chatBox.scrollTop = chatBox.scrollHeight;
             });
+            
+            loadNotebooks();
         </script>
     </body>
     </html>

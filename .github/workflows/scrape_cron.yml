@@ -1,0 +1,21 @@
+name: Weekly Auto-Scrape MaxyCrawl
+
+on:
+  schedule:
+    # Runs at 00:00 every Sunday
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+    # Allows manual triggering from GitHub UI
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Trigger Scrape API
+        env:
+          # Change this to your actual production Vercel/Render URL
+          API_URL: "https://your-app.vercel.app" 
+          TARGET_URL: "https://recruitcrm.io" # Change to target URL
+        run: |
+          curl -X POST "$API_URL/api/scrape/trigger?url=$TARGET_URL"
