@@ -1387,19 +1387,16 @@ def read_root():
                     rawDiscoveredUrls = data.urls || [];
                     currentFilteredUrls = [...rawDiscoveredUrls];
                     
-                    // Default select top 50 (or all if < 50) for immediate fast action
+                    // Default select ALL discovered URLs so user can scrape all at once
                     selectedUrlSet.clear();
-                    const initialSelectCount = Math.min(50, rawDiscoveredUrls.length);
-                    for (let i = 0; i < initialSelectCount; i++) {
-                        selectedUrlSet.add(rawDiscoveredUrls[i]);
-                    }
+                    rawDiscoveredUrls.forEach(u => selectedUrlSet.add(u));
                     
                     document.getElementById('discoveryBox').style.display = 'block';
                     document.getElementById('discoveryCountText').textContent = `${rawDiscoveredUrls.length.toLocaleString()} Halaman Ditemukan`;
                     document.getElementById('urlFilterInput').value = '';
                     
                     renderDiscoveredUrls(rawDiscoveredUrls);
-                    showToast(`Berhasil menemukan ${rawDiscoveredUrls.length} halaman! (50 halaman teratas otomatis dipilih)`);
+                    showToast(`Berhasil menemukan ${rawDiscoveredUrls.length.toLocaleString()} halaman! (Semua otomatis terpilih)`);
                 } catch(e) {
                     showToast('Gagal membaca sitemap website', 'error');
                 }
@@ -1416,8 +1413,8 @@ def read_root():
                     return;
                 }
                 
-                // Render up to 500 items in virtual DOM
-                urls.slice(0, 500).forEach((u, idx) => {
+                const fragment = document.createDocumentFragment();
+                urls.forEach((u, idx) => {
                     const isChecked = selectedUrlSet.has(u);
                     const div = document.createElement('div');
                     div.className = `url-item ${isChecked ? 'selected' : ''}`;
@@ -1444,8 +1441,9 @@ def read_root():
                         updateSelectionUI();
                     };
                     
-                    list.appendChild(div);
+                    fragment.appendChild(div);
                 });
+                list.appendChild(fragment);
                 
                 updateSelectionUI();
             }
@@ -1459,7 +1457,7 @@ def read_root():
             function applyPresetSelection(type) {
                 if (type === 'all') {
                     rawDiscoveredUrls.forEach(u => selectedUrlSet.add(u));
-                    showToast(`Semua ${rawDiscoveredUrls.length} halaman dipilih`);
+                    showToast(`Semua ${rawDiscoveredUrls.length.toLocaleString()} halaman dipilih`);
                 } else if (type === 'none') {
                     selectedUrlSet.clear();
                     showToast('Pilihan dikosongkan');
@@ -1469,7 +1467,7 @@ def read_root():
                     for (let i = 0; i < count; i++) {
                         selectedUrlSet.add(rawDiscoveredUrls[i]);
                     }
-                    showToast(`${count} halaman teratas dipilih`);
+                    showToast(`${count.toLocaleString()} halaman teratas dipilih`);
                 }
                 renderDiscoveredUrls(currentFilteredUrls);
             }
@@ -1485,7 +1483,7 @@ def read_root():
                 selectedUrlSet.clear();
                 currentFilteredUrls.forEach(u => selectedUrlSet.add(u));
                 renderDiscoveredUrls(currentFilteredUrls);
-                showToast(`${currentFilteredUrls.length} halaman hasil filter dipilih`);
+                showToast(`${currentFilteredUrls.length.toLocaleString()} halaman hasil filter dipilih`);
             }
             
             function updateSelectionUI() {
@@ -1494,7 +1492,7 @@ def read_root():
                 const btn = document.getElementById('btnImportSelected');
                 
                 badge.textContent = `(${totalSelected.toLocaleString()} Dipilih)`;
-                btn.textContent = `📥 Simpan ${totalSelected.toLocaleString()} Halaman Terpilih`;
+                btn.textContent = `📥 Simpan Semua ${totalSelected.toLocaleString()} Halaman Terpilih`;
                 btn.disabled = totalSelected === 0;
             }
             
@@ -1513,8 +1511,8 @@ def read_root():
                 btn.disabled = true;
                 
                 let completed = 0;
-                // Process in concurrent batches of 4
-                const batchSize = 4;
+                // Process in concurrent batches of 6
+                const batchSize = 6;
                 for (let i = 0; i < selectedUrls.length; i += batchSize) {
                     const batch = selectedUrls.slice(i, i + batchSize);
                     await Promise.all(batch.map(async url => {
@@ -1525,11 +1523,11 @@ def read_root():
                         const pct = Math.round((completed / total) * 100);
                         progFill.style.width = `${pct}%`;
                         progPercent.textContent = `${pct}%`;
-                        progStatus.textContent = `Menyimpan ${completed} dari ${total} halaman (${pct}%)...`;
+                        progStatus.textContent = `Menyimpan ${completed.toLocaleString()} dari ${total.toLocaleString()} halaman (${pct}%)...`;
                     }));
                 }
                 
-                showToast(`Selesai menyimpan ${completed} dokumen ke notebook!`);
+                showToast(`Selesai menyimpan ${completed.toLocaleString()} dokumen ke notebook!`);
                 btn.disabled = false;
                 loadSources();
             }
