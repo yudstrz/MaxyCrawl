@@ -334,7 +334,41 @@ def read_root():
                 height: 100vh;
                 display: flex;
                 overflow: hidden;
+                position: relative;
             }
+            
+            /* Mobile Hamburger Button */
+            .mobile-menu-btn {
+                display: none;
+                position: fixed;
+                top: 0.75rem;
+                left: 0.75rem;
+                z-index: 1100;
+                background: var(--bg-card);
+                border: 1px solid var(--border);
+                color: var(--text-main);
+                width: 42px;
+                height: 42px;
+                border-radius: 0.5rem;
+                font-size: 1.35rem;
+                cursor: pointer;
+                align-items: center;
+                justify-content: center;
+                transition: all 0.2s;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+            }
+            .mobile-menu-btn:hover { background: var(--bg-card-hover); }
+            
+            /* Sidebar Overlay Backdrop (mobile only) */
+            .sidebar-overlay {
+                display: none;
+                position: fixed;
+                inset: 0;
+                background: rgba(0,0,0,0.6);
+                backdrop-filter: blur(2px);
+                z-index: 999;
+            }
+            .sidebar-overlay.active { display: block; }
             
             /* Sidebar */
             .sidebar {
@@ -345,6 +379,8 @@ def read_root():
                 flex-direction: column;
                 padding: 1.25rem 1rem;
                 flex-shrink: 0;
+                transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+                z-index: 1000;
             }
             .brand {
                 font-size: 1.15rem;
@@ -928,11 +964,257 @@ def read_root():
             .toast-success { border-left: 4px solid var(--success); }
             .toast-error { border-left: 4px solid var(--error); }
             @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+            
+            /* ========================================
+               MOBILE RESPONSIVE (< 768px)
+               ======================================== */
+            @media (max-width: 768px) {
+                .mobile-menu-btn { display: flex; }
+                
+                .sidebar {
+                    position: fixed;
+                    top: 0;
+                    left: 0;
+                    height: 100vh;
+                    width: 280px;
+                    transform: translateX(-100%);
+                    box-shadow: 4px 0 25px rgba(0,0,0,0.5);
+                    padding-top: 4rem;
+                }
+                .sidebar.open {
+                    transform: translateX(0);
+                }
+                
+                .main-content {
+                    width: 100%;
+                    min-width: 0;
+                }
+                
+                .empty-state {
+                    padding: 2rem 1.25rem;
+                }
+                .empty-state h2 {
+                    font-size: 1.25rem;
+                }
+                .empty-state p {
+                    font-size: 0.875rem;
+                }
+                
+                /* Workspace Header */
+                .workspace-header {
+                    padding: 1rem;
+                    flex-direction: column;
+                    align-items: flex-start;
+                    gap: 0.75rem;
+                }
+                .workspace-header > div:last-child {
+                    width: 100%;
+                    justify-content: space-between;
+                }
+                .workspace-title-area h2 {
+                    font-size: 1.1rem;
+                    word-break: break-word;
+                }
+                .status-pill {
+                    font-size: 0.65rem;
+                    padding: 0.15rem 0.45rem;
+                }
+                
+                /* Workspace Tabs */
+                .workspace-tabs {
+                    padding: 0 0.75rem;
+                    gap: 0.5rem;
+                    overflow-x: auto;
+                    -webkit-overflow-scrolling: touch;
+                }
+                .tab-btn {
+                    font-size: 0.825rem;
+                    white-space: nowrap;
+                    padding: 0.7rem 0.15rem;
+                }
+                
+                /* Sources View */
+                .sources-view {
+                    padding: 1rem;
+                    gap: 1rem;
+                }
+                
+                /* Add Source Card */
+                .add-source-card {
+                    padding: 1rem;
+                }
+                .add-source-header {
+                    flex-direction: column;
+                    align-items: flex-start;
+                    gap: 0.75rem;
+                }
+                .add-source-tabs {
+                    width: 100%;
+                }
+                .source-mode-btn {
+                    flex: 1;
+                    text-align: center;
+                    padding: 0.45rem 0.5rem;
+                    font-size: 0.75rem;
+                }
+                
+                /* Source Input Row */
+                .source-input-row {
+                    flex-direction: column;
+                    gap: 0.5rem;
+                }
+                .source-input-row .btn {
+                    width: 100%;
+                }
+                
+                /* Discovery Section */
+                .discovery-stats {
+                    flex-direction: column;
+                    align-items: flex-start;
+                    gap: 0.5rem;
+                }
+                .discovery-stats .btn {
+                    width: 100%;
+                }
+                .discovery-tools {
+                    flex-direction: column;
+                }
+                .discovery-tools .btn-secondary {
+                    width: 100%;
+                }
+                .quick-select-bar {
+                    padding: 0.4rem 0.5rem;
+                    gap: 0.3rem;
+                }
+                .preset-chip {
+                    font-size: 0.7rem;
+                    padding: 0.25rem 0.45rem;
+                }
+                .url-list-scroll {
+                    max-height: 200px;
+                }
+                
+                /* Source Cards */
+                .source-card {
+                    flex-direction: column;
+                    align-items: flex-start;
+                    gap: 0.75rem;
+                    padding: 0.85rem 1rem;
+                }
+                .source-card > div:first-child {
+                    margin-right: 0 !important;
+                    width: 100%;
+                }
+                .source-link {
+                    max-width: 100%;
+                }
+                .source-meta {
+                    width: 100%;
+                    justify-content: space-between;
+                }
+                
+                /* Chat Section */
+                .chat-messages {
+                    padding: 1rem;
+                    gap: 1rem;
+                }
+                .chat-bubble {
+                    max-width: 92%;
+                    padding: 0.85rem 1rem;
+                    font-size: 0.875rem;
+                }
+                .chat-input-container {
+                    padding: 0.85rem 1rem;
+                }
+                .chat-form input[type="text"] {
+                    font-size: 0.875rem;
+                    padding: 0.65rem 0.75rem;
+                }
+                
+                /* Modal Adjustments */
+                .modal-window {
+                    margin: 0.75rem;
+                    width: calc(100% - 1.5rem) !important;
+                    max-width: 100% !important;
+                    max-height: 90vh;
+                    overflow-y: auto;
+                }
+                
+                /* Toast Notifications */
+                #toastBox {
+                    bottom: 1rem;
+                    right: 0.75rem;
+                    left: 0.75rem;
+                }
+                .toast-item {
+                    font-size: 0.8rem;
+                    padding: 0.65rem 1rem;
+                }
+
+                /* Saved docs header */
+                .sources-view > div[style*="justify-content: space-between"] {
+                    flex-wrap: wrap;
+                    gap: 0.5rem;
+                }
+            }
+            
+            /* ========================================
+               SMALL MOBILE (< 400px)
+               ======================================== */
+            @media (max-width: 400px) {
+                .sidebar {
+                    width: 260px;
+                }
+                .workspace-header {
+                    padding: 0.75rem;
+                }
+                .workspace-title-area h2 {
+                    font-size: 1rem;
+                }
+                .source-mode-btn {
+                    font-size: 0.68rem;
+                }
+                .preset-chip {
+                    font-size: 0.65rem;
+                    padding: 0.2rem 0.35rem;
+                }
+                .action-btn {
+                    font-size: 0.7rem;
+                    padding: 0.3rem 0.5rem;
+                }
+            }
+            
+            /* ========================================
+               TABLET (769px - 1024px)
+               ======================================== */
+            @media (min-width: 769px) and (max-width: 1024px) {
+                .sidebar {
+                    width: 240px;
+                }
+                .sources-view {
+                    padding: 1.25rem 1.5rem;
+                }
+                .workspace-header {
+                    padding: 1rem 1.5rem;
+                }
+                .workspace-tabs {
+                    padding: 0 1.5rem;
+                }
+                .source-link {
+                    max-width: 300px;
+                }
+            }
         </style>
     </head>
     <body>
+        <!-- Mobile Menu Button -->
+        <button class="mobile-menu-btn" id="mobileMenuBtn" onclick="toggleMobileSidebar()" aria-label="Toggle Menu">☰</button>
+        
+        <!-- Sidebar Overlay (mobile) -->
+        <div class="sidebar-overlay" id="sidebarOverlay" onclick="closeMobileSidebar()"></div>
+        
         <!-- Left Sidebar -->
-        <aside class="sidebar">
+        <aside class="sidebar" id="sidebar">
             <div class="brand">
                 <span>📚</span> MaxyCrawl LM
                 <span class="brand-badge">PRO</span>
@@ -1573,6 +1855,36 @@ def read_root():
                 sendBtn.textContent = "Kirim";
                 chatBox.scrollTop = chatBox.scrollHeight;
             });
+            
+            // Mobile sidebar toggle
+            function toggleMobileSidebar() {
+                const sidebar = document.getElementById('sidebar');
+                const overlay = document.getElementById('sidebarOverlay');
+                const btn = document.getElementById('mobileMenuBtn');
+                const isOpen = sidebar.classList.contains('open');
+                if (isOpen) {
+                    closeMobileSidebar();
+                } else {
+                    sidebar.classList.add('open');
+                    overlay.classList.add('active');
+                    btn.textContent = '✕';
+                }
+            }
+            function closeMobileSidebar() {
+                const sidebar = document.getElementById('sidebar');
+                const overlay = document.getElementById('sidebarOverlay');
+                const btn = document.getElementById('mobileMenuBtn');
+                sidebar.classList.remove('open');
+                overlay.classList.remove('active');
+                btn.textContent = '☰';
+            }
+            
+            // Auto-close sidebar on notebook select (mobile)
+            const origSelectNotebook = selectNotebook;
+            selectNotebook = async function(id, name) {
+                closeMobileSidebar();
+                return origSelectNotebook(id, name);
+            };
             
             loadNotebooks();
         </script>
