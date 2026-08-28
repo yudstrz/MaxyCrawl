@@ -1454,7 +1454,7 @@ def read_root():
                     sitemapBtn.classList.add('active');
                     singleBtn.classList.remove('active');
                     input.placeholder = "https://recruitcrm.io (Domain atau URL Website)";
-                    actionBtn.innerHTML = "<i data-lucide="search" style="width: 16px; height: 16px;"></i> Temukan Semua Halaman";
+                    actionBtn.innerHTML = '<i data-lucide="search" style="width: 16px; height: 16px;"></i> Temukan Semua Halaman';
                 } else {
                     singleBtn.classList.add('active');
                     sitemapBtn.classList.remove('active');
@@ -1711,7 +1711,7 @@ def read_root():
                     showToast('Gagal membaca sitemap website', 'error');
                 }
                 btn.disabled = false;
-                btn.textContent = "<i data-lucide="search" style="width: 16px; height: 16px;"></i> Temukan Semua Halaman";
+                btn.innerHTML = '<i data-lucide="search" style="width: 16px; height: 16px;"></i> Temukan Semua Halaman';
             }
             
             function renderDiscoveredUrls(urls) {
