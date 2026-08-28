@@ -244,6 +244,25 @@ def discover_all_urls(base_url: str) -> list[str]:
             if child not in visited_sitemaps:
                 queue.append(child)
 
+    # Fallback to HTML crawling if sitemap found nothing
+    if not all_page_urls:
+        log.info("No URLs found in sitemap, attempting basic HTML crawling on base URL...")
+        try:
+            with httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=30, follow_redirects=True) as client:
+                resp = client.get(base_url)
+                if resp.status_code == 200:
+                    tree = etree.HTML(resp.content)
+                    if tree is not None:
+                        for a in tree.xpath("//a[@href]"):
+                            href = a.get("href").strip()
+                            # abaikan link anchor/hash dan link eksternal
+                            if href.startswith("/") and not href.startswith("//"):
+                                all_page_urls.append(base_url.rstrip("/") + href)
+                            elif href.startswith(base_url):
+                                all_page_urls.append(href)
+        except Exception as exc:
+            log.warning(f"Fallback HTML crawling failed: {exc}")
+
     # Deduplicate while preserving order
     seen: set[str] = set()
     unique_urls = []

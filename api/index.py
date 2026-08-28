@@ -287,7 +287,25 @@ async def discover_sitemap(url: str = Query(...)):
 
             await asyncio.gather(*(fetch_sitemap(u) for u in batch))
 
-    # If sitemap found nothing, at least return the base url
+    # Jika sitemap tidak ditemukan, lakukan crawling dasar pada base URL untuk mencari link internal
+    if not all_page_urls:
+        try:
+            async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS, follow_redirects=True) as client:
+                resp = await client.get(base_url, headers={"User-Agent": USER_AGENT})
+                if resp.status_code == 200:
+                    tree = etree.HTML(resp.content)
+                    if tree is not None:
+                        for a in tree.xpath("//a[@href]"):
+                            href = a.get("href").strip()
+                            # abaikan link anchor/hash dan link eksternal
+                            if href.startswith("/") and not href.startswith("//"):
+                                all_page_urls.add(base_url + href)
+                            elif href.startswith(base_url):
+                                all_page_urls.add(href)
+        except Exception:
+            pass
+
+    # Jika masih tidak ada, setidaknya kembalikan base url
     if not all_page_urls:
         all_page_urls.add(base_url)
 
@@ -1346,9 +1364,7 @@ def read_root():
                 <div class="tab-content" id="tab-chat">
                     <div class="chat-view">
                         <div class="chat-messages" id="chatMessages">
-                            <div class="chat-bubble bubble-ai">
-                                Halo! Saya adalah Asisten AI untuk Notebook ini. Saya telah membaca seluruh dokumen yang tersimpan dan siap menjawab pertanyaan Anda secara akurat berdasarkan data tersebut.
-                            </div>
+                            <div class="chat-bubble bubble-ai">Halo! Saya adalah Asisten AI untuk Notebook ini. Saya telah membaca seluruh dokumen yang tersimpan dan siap menjawab pertanyaan Anda secara akurat berdasarkan data tersebut.</div>
                         </div>
                         <div class="chat-input-container">
                             <form class="chat-form" id="chatForm">
