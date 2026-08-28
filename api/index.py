@@ -22,7 +22,8 @@ from api.database import (
     log_chat,
     delete_source,
     delete_notebook,
-    get_source_detail
+    get_source_detail,
+    get_chat_logs
 )
 
 load_dotenv()
@@ -128,6 +129,10 @@ async def chat_with_notebook(notebook_id: int, req: ChatRequest):
     await log_chat(notebook_id, req.query, answer)
     
     return ChatResponse(answer=answer)
+
+@app.get("/api/notebooks/{notebook_id}/chat")
+async def get_notebook_chats(notebook_id: int):
+    return await get_chat_logs(notebook_id)
 
 # --- NOTEBOOK API ---
 class NotebookCreate(BaseModel):
@@ -323,21 +328,22 @@ def read_root():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>MaxyCrawl - AI Knowledge Assistant</title>
         <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+        <script src="https://unpkg.com/lucide@latest"></script>
         <style>
             :root {
-                --bg-base: #090d16;
-                --bg-sidebar: #0e1424;
-                --bg-card: #151d30;
-                --bg-card-hover: #1e2942;
-                --bg-input: #101728;
-                --border: #222f4c;
+                --bg-base: #09090b;
+                --bg-sidebar: #18181b;
+                --bg-card: #18181b;
+                --bg-card-hover: #27272a;
+                --bg-input: #09090b;
+                --border: #27272a;
                 --border-focus: #4f46e5;
-                --primary: #6366f1;
-                --primary-hover: #4f46e5;
-                --primary-subtle: rgba(99, 102, 241, 0.12);
-                --text-main: #f8fafc;
-                --text-muted: #94a3b8;
-                --text-dim: #64748b;
+                --primary: #4f46e5;
+                --primary-hover: #4338ca;
+                --primary-subtle: rgba(79, 70, 229, 0.15);
+                --text-main: #f4f4f5;
+                --text-muted: #a1a1aa;
+                --text-dim: #71717a;
                 --success: #10b981;
                 --success-bg: rgba(16, 185, 129, 0.15);
                 --error: #ef4444;
@@ -588,9 +594,9 @@ def read_root():
             .add-source-card {
                 background: var(--bg-card);
                 border: 1px solid var(--border);
-                border-radius: 0.85rem;
+                border-radius: 0.5rem;
                 padding: 1.25rem 1.5rem;
-                box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+                
             }
             .add-source-header {
                 display: flex;
@@ -900,7 +906,7 @@ def read_root():
             .chat-bubble {
                 max-width: 80%;
                 padding: 1rem 1.25rem;
-                border-radius: 0.85rem;
+                border-radius: 0.5rem;
                 line-height: 1.6;
                 font-size: 0.925rem;
                 white-space: pre-wrap;
@@ -942,11 +948,11 @@ def read_root():
             .modal-window {
                 background: var(--bg-card);
                 border: 1px solid var(--border);
-                border-radius: 0.85rem;
+                border-radius: 0.5rem;
                 padding: 1.5rem;
                 width: 500px;
                 max-width: 90%;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+                box-shadow: 0 4px 24px rgba(0,0,0,0.4);
             }
             .modal-window h3 {
                 margin-bottom: 0.75rem;
@@ -1226,7 +1232,7 @@ def read_root():
     </head>
     <body>
         <!-- Mobile Menu Button -->
-        <button class="mobile-menu-btn" id="mobileMenuBtn" onclick="toggleMobileSidebar()" aria-label="Toggle Menu">☰</button>
+        <button class="mobile-menu-btn" id="mobileMenuBtn" onclick="toggleMobileSidebar()" aria-label="Toggle Menu"><i data-lucide="menu"></i></button>
         
         <!-- Sidebar Overlay (mobile) -->
         <div class="sidebar-overlay" id="sidebarOverlay" onclick="closeMobileSidebar()"></div>
@@ -1273,7 +1279,7 @@ def read_root():
                         📁 Sumber Pengetahuan <span class="tab-badge" id="sourceCountBadge">0</span>
                     </button>
                     <button class="tab-btn" id="btnTabChat" onclick="switchTab('chat')">
-                        💬 Tanya Dokumen (AI)
+                        <i data-lucide="message-square" style="width: 16px; height: 16px;"></i> Tanya Dokumen (AI)
                     </button>
                 </div>
                 
@@ -1295,7 +1301,7 @@ def read_root():
                             <div class="source-input-row">
                                 <input type="url" id="sourceInputUrl" placeholder="https://recruitcrm.io (Domain atau URL Website)" onkeydown="if(event.key==='Enter') executeAddSource()">
                                 <button class="btn" id="btnAddSourceAction" onclick="executeAddSource()">
-                                    🔍 Temukan Semua Halaman
+                                    <i data-lucide="search" style="width: 16px; height: 16px;"></i> Temukan Semua Halaman
                                 </button>
                             </div>
                             
@@ -1350,7 +1356,7 @@ def read_root():
                         <!-- List Sumber Tersimpan -->
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 0.5rem;">
                             <h3 style="font-size: 1.05rem; font-weight: 600;">Daftar Dokumen Tersimpan</h3>
-                            <button class="btn btn-secondary" style="padding: 0.35rem 0.65rem; font-size: 0.8rem;" onclick="loadSources()">🔄 Refresh Daftar</button>
+                            <button class="btn btn-secondary" style="padding: 0.35rem 0.65rem; font-size: 0.8rem;" onclick="loadSources()"><i data-lucide="refresh-cw" style="width: 14px; height: 14px;"></i> Refresh Daftar</button>
                         </div>
                         
                         <div class="sources-list" id="sourcesList">
@@ -1363,6 +1369,12 @@ def read_root():
                 <!-- Tab: Tanya Dokumen (AI Chat) -->
                 <div class="tab-content" id="tab-chat">
                     <div class="chat-view">
+                        
+                        <div style="display: flex; justify-content: space-between; align-items: center; padding: 1rem 2rem; border-bottom: 1px solid var(--border);">
+                            <h3 style="font-size: 1.05rem; font-weight: 600;">Percakapan AI</h3>
+                            <button class="btn btn-secondary" style="padding: 0.35rem 0.65rem; font-size: 0.8rem;" onclick="clearChatUI()"><i data-lucide="trash-2" style="width:14px; height:14px;"></i> Bersihkan Layar</button>
+                        </div>
+    
                         <div class="chat-messages" id="chatMessages">
                             <div class="chat-bubble bubble-ai">Halo! Saya adalah Asisten AI untuk Notebook ini. Saya telah membaca seluruh dokumen yang tersimpan dan siap menjawab pertanyaan Anda secara akurat berdasarkan data tersebut.</div>
                         </div>
@@ -1442,7 +1454,7 @@ def read_root():
                     sitemapBtn.classList.add('active');
                     singleBtn.classList.remove('active');
                     input.placeholder = "https://recruitcrm.io (Domain atau URL Website)";
-                    actionBtn.innerHTML = "🔍 Temukan Semua Halaman";
+                    actionBtn.innerHTML = "<i data-lucide="search" style="width: 16px; height: 16px;"></i> Temukan Semua Halaman";
                 } else {
                     singleBtn.classList.add('active');
                     sitemapBtn.classList.remove('active');
@@ -1467,7 +1479,7 @@ def read_root():
                         item.className = `notebook-item ${currentNbId === nb.id ? 'active' : ''}`;
                         item.innerHTML = `
                             <span class="notebook-name">📓 ${nb.name}</span>
-                            <button class="btn-delete-nb" title="Hapus Notebook" onclick="event.stopPropagation(); deleteNotebook(${nb.id}, '${nb.name}')">🗑️</button>
+                            <button class="btn-delete-nb" title="Hapus Notebook" onclick="event.stopPropagation(); deleteNotebook(${nb.id}, '${nb.name}')"><i data-lucide="trash-2" style="width: 14px; height: 14px;"></i></button>
                         `;
                         item.onclick = () => selectNotebook(nb.id, nb.name);
                         list.appendChild(item);
@@ -1587,7 +1599,7 @@ def read_root():
                                 <div class="action-btn-group">
                                     <button class="action-btn" onclick="previewSource(${s.id})" title="Lihat Isi Dokumen">👁️ Preview</button>
                                     <button class="action-btn" onclick="reSyncSource('${s.url}')" title="Perbarui Data">🔄 Update</button>
-                                    <button class="action-btn action-btn-del" onclick="deleteSource(${s.id})" title="Hapus Dokumen">🗑️</button>
+                                    <button class="action-btn action-btn-del" onclick="deleteSource(${s.id})" title="Hapus Dokumen"><i data-lucide="trash-2" style="width: 14px; height: 14px;"></i></button>
                                 </div>
                             </div>
                         `;
@@ -1699,7 +1711,7 @@ def read_root():
                     showToast('Gagal membaca sitemap website', 'error');
                 }
                 btn.disabled = false;
-                btn.textContent = "🔍 Temukan Semua Halaman";
+                btn.textContent = "<i data-lucide="search" style="width: 16px; height: 16px;"></i> Temukan Semua Halaman";
             }
             
             function renderDiscoveredUrls(urls) {
@@ -1892,7 +1904,7 @@ def read_root():
                 const btn = document.getElementById('mobileMenuBtn');
                 sidebar.classList.remove('open');
                 overlay.classList.remove('active');
-                btn.textContent = '☰';
+                btn.textContent = '<i data-lucide="menu"></i>';
             }
             
             // Auto-close sidebar on notebook select (mobile)
@@ -1904,6 +1916,7 @@ def read_root():
             
             loadNotebooks();
         </script>
+        <script>lucide.createIcons();</script>
     </body>
     </html>
     """

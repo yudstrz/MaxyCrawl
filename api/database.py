@@ -185,3 +185,17 @@ async def log_chat(notebook_id: int, query: str, answer: str):
     except Exception as e:
         print(f"Error logging chat: {e}")
 
+async def get_chat_logs(notebook_id: int):
+    client = get_db_client()
+    if not client:
+        return []
+    try:
+        rs = await client.execute(
+            "SELECT id, query, answer, created_at FROM chat_logs WHERE notebook_id = ? ORDER BY created_at ASC",
+            [notebook_id]
+        )
+        return [{"id": row[0], "query": row[1], "answer": row[2], "created_at": row[3]} for row in rs.rows]
+    except Exception as e:
+        print(f"Error getting chat logs: {e}")
+        return []
+
